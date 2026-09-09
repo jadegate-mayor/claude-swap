@@ -818,7 +818,7 @@ class AutoSwitchEngine:
         # not one fetch read thrice.
         self._model_window_missing_reads = 0
         self._model_window_missing_fetch_ts: float | None = None
-        self._model_window_missing_account: str | None = None
+        self._model_window_missing_account: tuple[str, str, str] | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -1536,8 +1536,13 @@ class AutoSwitchEngine:
         # The departure snapshot of the account we are leaving, taken from the
         # SAME `usage`/`headroom` the ranking just decided on — for
         # consume-first that is the phase-2 refetch, not the stale one.
+        # A seat left for losing its model window is recorded as SPENT (0
+        # headroom), not at its account-wide number: for the model it can
+        # serve nothing, and the no-return release compares the seat's later
+        # headroom against this value — recorded at 48 account-wide points a
+        # window returning with 6 would never read as "recovered".
         left_snapshot = (
-            active_headroom,
+            0.0 if model_window_lost else active_headroom,
             _binding_recovery_ts(usage.get(current), self._models, decided_now),
         )
         transient_failure = False
@@ -2520,13 +2525,21 @@ class AutoSwitchEngine:
         """
         if not self._named_models:
             return 0
-        if current != self._model_window_missing_account:
+        identity = self.switcher.account_identity(current)
+        key = (
+            current,
+            str(identity.get("uuid") or ""),
+            str(identity.get("organizationUuid") or ""),
+        )
+        if key != self._model_window_missing_account:
             # Observations belong to ONE account. A manual `cswap switch`
             # (or our own) must not let the new seat inherit the old seat's
-            # count and trip on its first read.
+            # count and trip on its first read — and neither must a login
+            # that replaced the slot's account under the same number
+            # (`cswap add --slot N`), hence the identity in the key.
             self._model_window_missing_reads = 0
             self._model_window_missing_fetch_ts = None
-            self._model_window_missing_account = current
+            self._model_window_missing_account = key
         state = _model_window_state(usage.get(current), self._named_models)
         if state == "present":
             self._model_window_missing_reads = 0

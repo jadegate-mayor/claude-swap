@@ -570,3 +570,40 @@ class TestReviewRoundOne:
         assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert "1/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
+
+
+class TestReviewRoundTwo:
+    def test_lost_window_departure_is_recorded_as_spent(self, temp_home):
+        # P2: the no-return release compares the left seat's later headroom
+        # against what we recorded on leaving. A seat left for losing its
+        # model window served nothing for the model, so it is recorded spent
+        # — a window returning with a few points then reads as recovered.
+        h = _harness(temp_home, model="Fable")
+        gone = _seat(five_h=52, seven_d=30)   # 48 account-wide points
+        fleet = {"1": gone, "2": _seat(five_h=0, seven_d=0), "3": _seat(five_h=40, fable=50)}
+        for _ in range(3):
+            h.clock.advance(300)
+            outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        state = h.state()
+        assert state["lastSwitchFrom"] == 1
+        assert state["leftHeadroom"] == 0.0
+        assert state["leftTrigger"] == "at-limit"
+
+    def test_slot_replacement_starts_the_count_over(self, temp_home):
+        # P2: `cswap add --slot 1` keeps the number but changes the account;
+        # the two observations belonged to the previous login.
+        h = _harness(temp_home, model="Fable")
+        gone = _seat(five_h=52, seven_d=30)
+        fleet = {"1": gone, "2": _seat(five_h=0, seven_d=0), "3": _seat(five_h=40, fable=50)}
+        for _ in range(2):
+            h.clock.advance(300)
+            assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert "2/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["1"]["uuid"] = "uuid-replacement"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.clock.advance(300)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "1/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
