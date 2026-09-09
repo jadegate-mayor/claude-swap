@@ -3499,7 +3499,9 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, seq)
             # Plan tier from the credential just captured (after the write,
             # outside every lock; best effort).
-            self._probe_plan_tier(account_num, current_creds)
+            self._probe_plan_tier(
+                account_num, current_creds, (current_email, current_org_uuid)
+            )
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3658,7 +3660,9 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         # Plan tier from the credential just captured (after the write,
         # outside every lock; best effort).
-        self._probe_plan_tier(account_num, current_creds)
+        self._probe_plan_tier(
+            account_num, current_creds, (current_email, organization_uuid)
+        )
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4868,7 +4872,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
-        refresh_tier: bool = False,
+        force_tier: set[str] | None = None,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4967,7 +4971,7 @@ class ClaudeAccountSwitcher:
             pre = entries
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims],
-                profile_due=self._tier_due_slots(claims, force=refresh_tier),
+                profile_due=self._tier_due_slots(claims, force=force_tier),
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -4980,7 +4984,7 @@ class ClaudeAccountSwitcher:
             # Tier label + Fable flag ride on the accepted successes. Best
             # effort by contract: the usage measurement is already committed,
             # and a label-cache hiccup must never surface as a fetch failure.
-            self._persist_tier_from_records(accepted_records)
+            self._persist_tier_from_records(accepted_records, identities)
             entries = store.entries(identities, models)
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
@@ -5001,22 +5005,25 @@ class ClaudeAccountSwitcher:
     # -- plan tier (subscription tier + Fable access) ---------------------
 
     def _tier_due_slots(
-        self, nums: "set[str] | dict[str, str] | list[str]", *, force: bool = False
+        self,
+        nums: "set[str] | dict[str, str] | list[str]",
+        *,
+        force: "set[str] | None" = None,
     ) -> set[str]:
         """Slots whose cached plan tier is missing or older than the TTL
-        (``force`` makes every slot due — ``cswap list --refresh``)."""
-        if force:
-            return {str(n) for n in nums}
+        (``plan_tier.tier_due``, which also paces retries after a failed
+        read). ``force`` names slots that are due regardless — ``cswap list
+        --refresh`` for the slots its direct probe could not reach."""
+        wanted = {str(n) for n in nums}
+        forced = {str(n) for n in force} & wanted if force else set()
         try:
             data = self._get_sequence_data() or {}
         except ClaudeSwitchError:
-            return set()
+            return forced
         now = self._usage_store.clock()
         accounts = data.get("accounts", {})
-        return {
-            str(n)
-            for n in nums
-            if plan_tier.tier_due(accounts.get(str(n)), now)
+        return forced | {
+            n for n in wanted if plan_tier.tier_due(accounts.get(n), now)
         }
 
     @staticmethod
@@ -5037,12 +5044,16 @@ class ClaudeAccountSwitcher:
                 if tier is not None:
                     fields.update(plan_tier.tier_record_fields(tier, now))
                 else:
-                    fields.update(plan_tier.tier_error_fields("no-tier-fields"))
+                    fields.update(plan_tier.tier_error_fields("no-tier-fields", now))
             elif profile.error:
-                fields.update(plan_tier.tier_error_fields(profile.error))
+                fields.update(plan_tier.tier_error_fields(profile.error, now))
         return fields
 
-    def _persist_tier_from_records(self, records: dict[str, FetchRecord]) -> None:
+    def _persist_tier_from_records(
+        self,
+        records: dict[str, FetchRecord],
+        identities: "dict[str, tuple[str, str]] | None" = None,
+    ) -> None:
         """Write the tier/Fable facts the given successful records carry.
         Never raises (see ``_persist_tier_fields``)."""
         if not records:
@@ -5053,13 +5064,23 @@ class ClaudeAccountSwitcher:
             for num, record in records.items()
             if (fields := self._tier_fields_from_record(record, now))
         }
-        self._persist_tier_fields(updates)
+        self._persist_tier_fields(updates, identities)
 
-    def _persist_tier_fields(self, updates: dict[str, dict]) -> None:
+    def _persist_tier_fields(
+        self,
+        updates: dict[str, dict],
+        identities: "dict[str, tuple[str, str]] | None" = None,
+    ) -> None:
         """Merge per-slot tier fields into ``sequence.json`` under the account
         lock, re-reading first so a concurrent alias/disable edit is never
         clobbered by a stale copy. Writes only when a value changed (most
         passes change nothing). Caller must NOT hold ``self.lock_file``.
+
+        ``identities`` (slot → ``(email, organizationUuid)`` as fetched) is
+        checked under the lock: a ``swap``/``move`` committing while the
+        profile request was in flight renumbers slots, and the fields belong
+        to the ACCOUNT that answered, not to whoever now holds its number.
+        A mismatch drops that slot's update (the next pass re-reads).
 
         Best effort: the label is a cache of a fact that will be re-read
         within the TTL, so a failed write is logged and dropped rather than
@@ -5078,6 +5099,16 @@ class ClaudeAccountSwitcher:
                     record = accounts.get(str(num))
                     if not isinstance(record, dict):
                         continue  # slot removed since the fetch started
+                    expected = identities.get(str(num)) if identities else None
+                    if expected is not None and (
+                        (record.get("email") or "") != (expected[0] or "")
+                        or (record.get("organizationUuid") or "") != (expected[1] or "")
+                    ):
+                        self._logger.debug(
+                            "Slot %s changed identity during the tier read; "
+                            "dropping its tier update", num,
+                        )
+                        continue
                     if plan_tier.merge_record_fields(record, fields):
                         changed = True
                 if changed:
@@ -5087,15 +5118,22 @@ class ClaudeAccountSwitcher:
                 "Could not persist plan-tier fields (usage itself was recorded): %r", e
             )
 
-    def _probe_plan_tier(self, account_num: str, creds: str) -> None:
+    def _probe_plan_tier(
+        self,
+        account_num: str,
+        creds: str,
+        identity: "tuple[str, str] | None" = None,
+    ) -> bool:
         """One profile read for a slot whose credential was just captured
-        (``cswap add``) or explicitly refreshed. Skipped, never refreshed,
-        when the access token is expired: consuming a grant is a coordinated
-        transition elsewhere in this class. Must NOT be called under a lock."""
+        (``cswap add``) or explicitly refreshed. Skipped (False), never
+        refreshed, when the access token is expired: consuming a grant is a
+        coordinated transition elsewhere in this class. ``identity`` is the
+        ``(email, organizationUuid)`` the credential belongs to, checked
+        under the lock before the merge. Must NOT be called under a lock."""
         token = oauth.extract_access_token(creds)
         data = oauth.extract_oauth_data(creds)
         if not token or not data or oauth.is_oauth_token_expired(data.get("expiresAt")):
-            return
+            return False
         outcome = oauth.fetch_oauth_plan_profile(token)
         now = self._usage_store.clock()
         fields: dict
@@ -5104,23 +5142,60 @@ class ClaudeAccountSwitcher:
             fields = (
                 plan_tier.tier_record_fields(tier, now)
                 if tier is not None
-                else plan_tier.tier_error_fields("no-tier-fields")
+                else plan_tier.tier_error_fields("no-tier-fields", now)
             )
         else:
-            fields = plan_tier.tier_error_fields(outcome.error or "unknown")
-        self._persist_tier_fields({str(account_num): fields})
+            fields = plan_tier.tier_error_fields(outcome.error or "unknown", now)
+        self._persist_tier_fields(
+            {str(account_num): fields},
+            {str(account_num): identity} if identity is not None else None,
+        )
+        return True
+
+    def _probe_credential_for(
+        self, num: str, email: str, org_uuid: str, is_active: bool, creds: str
+    ) -> str:
+        """The credential an explicit tier probe should present for a slot:
+        the same choice ``_fetch_account_usage`` makes. An inactive slot that
+        has run under ``cswap run`` holds its newest token in the session
+        profile (the backup is a consumed generation), so the profile wins
+        while its token is live and its identity still matches the slot;
+        otherwise the stored credential."""
+        if is_active:
+            return creds
+        from claude_swap.session import (
+            read_session_credentials,
+            session_identity_drifted,
+        )
+        session_dir = self._session_dir(num, email)
+        session_creds = read_session_credentials(session_dir)
+        if not session_creds or session_identity_drifted(session_dir, email, org_uuid):
+            return creds
+        session_oauth = oauth.extract_oauth_data(session_creds)
+        if (
+            session_oauth
+            and session_oauth.get("accessToken")
+            and not oauth.is_oauth_token_expired(session_oauth.get("expiresAt"))
+        ):
+            return session_creds
+        return creds
 
     def refresh_plan_tiers(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
-    ) -> None:
+    ) -> set[str]:
         """Re-read every OAuth slot's plan tier now (``cswap list --refresh``),
-        independent of the usage poll's TTL/backoff gates. Slots with no
-        usable live access token are skipped (the poll path picks them up
-        after its refresh)."""
-        for num, _email, _org, _uuid, _active, creds, _alias in accounts_info:
+        independent of the usage poll's TTL/backoff gates. Returns the slots
+        actually probed; slots with no usable live access token are skipped
+        (the collect pass is asked to probe those after its own refresh)."""
+        probed: set[str] = set()
+        for num, email, _org, org_uuid, is_active, creds, _alias in accounts_info:
             if not creds or looks_like_api_key(creds):
                 continue
-            self._probe_plan_tier(str(num), creds)
+            n = str(num)
+            probe_creds = self._probe_credential_for(n, email, org_uuid or "", is_active, creds)
+            if self._probe_plan_tier(n, probe_creds, (email, org_uuid or "")):
+                probed.add(n)
+        return probed
 
     def plan_tier_labels(self, *, compact: bool = True) -> dict[str, str]:
         """Slot → rendered tier label (``"Team std · no Fable"``) for every
@@ -5601,10 +5676,15 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
+        force_tier: set[str] | None = None
         if refresh:
-            self.refresh_plan_tiers(accounts_info)
+            # Probe every slot with a live token directly, then ask the
+            # collect pass to cover only the rest (their token may be
+            # refreshed inside the fetch) — one profile read per slot.
+            probed = self.refresh_plan_tiers(accounts_info)
+            force_tier = {str(info[0]) for info in accounts_info} - probed
         entries = self._collect_usage_entries(
-            accounts_info, fetch=fetch, refresh_tier=refresh
+            accounts_info, fetch=fetch, force_tier=force_tier
         )
 
         if json_output:
@@ -5723,6 +5803,9 @@ class ClaudeAccountSwitcher:
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
         entry = self._active_account_usage(account_num, current_email, org_uuid)
+        # The collect pass above may have just cached a tier / Fable flag;
+        # project the roster as it stands AFTER it, not the pre-fetch copy.
+        acct = self._tier_record_after_fetch(account_num, acct)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
@@ -5777,21 +5860,35 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
-            tier_text = plan_tier.tier_display(data["accounts"][account_num])
+            # Collect BEFORE printing the header: the pass may cache the tier
+            # this very call, and the label must reflect it.
+            entry = self._active_account_usage(
+                account_num, current_email, current_org_uuid
+            )
+            tier_text = plan_tier.tier_display(
+                self._tier_record_after_fetch(account_num, data["accounts"][account_num])
+            )
             tier_part = f" {muted(f'[{tier_text}]')}" if tier_text else ""
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
                 f"({current_email} {muted(f'[{tag}]')}){tier_part}"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
-            entry = self._active_account_usage(
-                account_num, current_email, current_org_uuid
-            )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
+
+    def _tier_record_after_fetch(self, account_num: str, fallback: dict) -> dict:
+        """The slot's roster record re-read after a collect pass (which may
+        have just persisted tier fields); ``fallback`` when unreadable."""
+        try:
+            data = self._get_sequence_data() or {}
+        except ClaudeSwitchError:
+            return fallback
+        record = data.get("accounts", {}).get(str(account_num))
+        return record if isinstance(record, dict) else fallback
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""

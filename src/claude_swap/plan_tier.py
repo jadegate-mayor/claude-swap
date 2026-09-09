@@ -39,6 +39,11 @@ from datetime import datetime, timezone
 #: high-cadence signal and this rides on its successes.
 TIER_TTL_S = 24 * 60 * 60
 
+#: After a FAILED profile read, do not try again sooner than this (1 h) —
+#: the read rides on every successful usage poll, and a seat whose profile
+#: keeps failing must not cost one extra request per poll.
+TIER_RETRY_S = 60 * 60
+
 #: Model whose per-model weekly window decides the "Fable" / "no Fable" flag.
 FABLE_MODEL_NAME = "Fable"
 
@@ -63,6 +68,7 @@ RECORD_KEYS = (
     "hasClaudeMax",
     "hasClaudePro",
     "tierFetchedAt",
+    "tierAttemptedAt",
     "tierError",
     "fableAccess",
 )
@@ -222,14 +228,16 @@ def tier_record_fields(tier: PlanTier, now: float) -> dict:
         "hasClaudeMax": tier.has_claude_max,
         "hasClaudePro": tier.has_claude_pro,
         "tierFetchedAt": _iso_z(now),
+        "tierAttemptedAt": _iso_z(now),
         "tierError": None,
     }
 
 
-def tier_error_fields(error: str) -> dict:
-    """Record fields for a failed profile read: only the error is written, so
-    a transient failure never blanks a known tier."""
-    return {"tierError": error}
+def tier_error_fields(error: str, now: float) -> dict:
+    """Record fields for a failed profile read: the error kind and the
+    attempt time (which paces the retry). The cached tier is not touched,
+    so a transient failure never blanks a known label."""
+    return {"tierError": error, "tierAttemptedAt": _iso_z(now)}
 
 
 def fable_record_fields(access: bool | None) -> dict:
@@ -253,20 +261,26 @@ def tier_fetched_at(record: dict | None) -> float | None:
     return _parse_iso((record or {}).get("tierFetchedAt"))
 
 
-def tier_due(record: dict | None, now: float, ttl: float = TIER_TTL_S) -> bool:
+def tier_due(
+    record: dict | None,
+    now: float,
+    ttl: float = TIER_TTL_S,
+    retry: float = TIER_RETRY_S,
+) -> bool:
     """Whether the profile should be (re)fetched for this account now.
 
-    Due when never fetched, when the cached tier is older than ``ttl``, or
-    when the last attempt failed and no tier is cached (an error with a
-    cached tier waits for the TTL like a success — the endpoint is not
-    hammered for a value we already have).
+    Due when never successfully fetched or when the cached tier is older
+    than ``ttl`` — unless an attempt (success or failure) was made within
+    ``retry``, which paces a persistently failing read to once an hour
+    instead of once per usage poll.
     """
     fetched = tier_fetched_at(record)
-    if fetched is None:
-        return True
-    if now - fetched >= ttl:
-        return True
-    return False
+    if fetched is not None and now - fetched < ttl:
+        return False
+    attempted = _parse_iso((record or {}).get("tierAttemptedAt"))
+    if attempted is not None and 0 <= now - attempted < retry:
+        return False
+    return True
 
 
 def tier_display(
@@ -341,6 +355,7 @@ __all__ = [
     "PlanTier",
     "RECORD_KEYS",
     "RELOGIN_TIER_TEXT",
+    "TIER_RETRY_S",
     "TIER_TTL_S",
     "fable_access",
     "fable_record_fields",

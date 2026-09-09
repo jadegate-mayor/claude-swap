@@ -157,11 +157,12 @@ class TestCacheRules:
         now = 1_800_000_000.0
         rec = plan_tier.tier_record_fields(plan_tier.tier_from_profile(MAX_5X), now)
         plan_tier.merge_record_fields(rec, plan_tier.fable_record_fields(True))
-        changed = plan_tier.merge_record_fields(rec, plan_tier.tier_error_fields("network"))
+        changed = plan_tier.merge_record_fields(rec, plan_tier.tier_error_fields("network", now + 5))
         assert changed
         assert rec["planTier"] == "Max 5x"
         assert rec["fableAccess"] is True
         assert rec["tierError"] == "network"
+        assert rec["tierAttemptedAt"] != rec["tierFetchedAt"]
         # ...and is still displayed
         assert plan_tier.tier_display(rec) == "Max 5x · Fable"
 
@@ -171,6 +172,19 @@ class TestCacheRules:
             rec, plan_tier.tier_record_fields(plan_tier.tier_from_profile(TEAM_STANDARD), 5.0)
         )
         assert rec["tierError"] is None
+
+    def test_failed_read_is_retried_hourly_not_per_poll(self):
+        now = 1_800_000_000.0
+        rec: dict = {}
+        plan_tier.merge_record_fields(rec, plan_tier.tier_error_fields("network", now))
+        assert not plan_tier.tier_due(rec, now + 60)
+        assert not plan_tier.tier_due(rec, now + plan_tier.TIER_RETRY_S - 1)
+        assert plan_tier.tier_due(rec, now + plan_tier.TIER_RETRY_S)
+        # a fresh success is never re-read inside its TTL, whatever the attempt stamp
+        rec.update(plan_tier.tier_record_fields(plan_tier.tier_from_profile(PRO), now + 7200))
+        assert not plan_tier.tier_due(rec, now + 7200 + plan_tier.TIER_RETRY_S + 1)
+        # a clock that went backwards does not wedge the retry
+        assert plan_tier.tier_due({"tierAttemptedAt": plan_tier._iso_z(now + 9999)}, now)
 
     def test_none_fable_never_overwrites_known_value(self):
         rec = {"fableAccess": True}
@@ -243,6 +257,7 @@ class TestJsonFields:
 
     def test_error_is_additive(self):
         assert plan_tier.tier_json_fields({"tierError": "http-401"})["tierError"] == "http-401"
+        assert "tierAttemptedAt" not in plan_tier.tier_json_fields({"tierAttemptedAt": "2027-01-01T00:00:00Z"})
 
     def test_account_row_merges_tier_fields(self):
         row = account_row(
@@ -539,9 +554,35 @@ class TestCollectorPersistsTier:
             oauth.ProfileOutcome(TEAM_STANDARD),
             refresh=True,
         )
-        assert profile_mock.call_count >= 2
+        # exactly one read per slot: the direct probe covered both, so the
+        # collect pass did not read them again
+        assert profile_mock.call_count == 2
         assert _record(switcher, "1")["planTier"] == "Team standard"
         assert _record(switcher, "2")["planTier"] == "Team standard"
+
+    def test_refresh_falls_back_to_the_collect_pass_for_unprobeable_slots(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Slot 2's stored token is expired: the direct probe skips it and the
+        collect pass (whose fetch would refresh it) is asked to cover it."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        for rec in sample_sequence_data["accounts"].values():
+            rec.update(plan_tier.tier_record_fields(plan_tier.tier_from_profile(MAX_20X), time.time()))
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        expired_backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1}})
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=expired_backup), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(USAGE_NO_FABLE, access_token="sk-refreshed")), \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile",
+                   return_value=oauth.ProfileOutcome(TEAM_STANDARD)) as profile_mock:
+            switcher.list_accounts(refresh=True)
+        tokens = [c.args[0] for c in profile_mock.call_args_list]
+        assert tokens.count("sk-active") == 1      # slot 1: direct probe only
+        assert tokens.count("sk-refreshed") == 1   # slot 2: collect pass only
+        assert profile_mock.call_count == 2
 
     def test_tier_fields_never_reach_the_usage_store(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -567,7 +608,8 @@ class TestCollectorPersistsTier:
         switcher = ClaudeAccountSwitcher()
         _seed(switcher, sample_sequence_data)
         assert switcher._tier_due_slots({"1", "2"}) == {"2"}
-        assert switcher._tier_due_slots({"1", "2"}, force=True) == {"1", "2"}
+        assert switcher._tier_due_slots({"1", "2"}, force={"1"}) == {"1", "2"}
+        assert switcher._tier_due_slots({"2"}, force={"1"}) == {"2"}  # force is scoped to the pass
 
     def test_persist_ignores_removed_slot_and_writes_only_on_change(
         self, temp_home: Path, sample_sequence_data: dict
@@ -580,12 +622,84 @@ class TestCollectorPersistsTier:
         switcher._persist_tier_fields({"1": {"planTier": "Pro"}})
         assert _record(switcher, "1")["planTier"] == "Pro"
 
+    def test_persist_drops_update_when_slot_changed_identity(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A swap committing while the profile request was in flight: the
+        slot number now names another account, so the answer is dropped."""
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        switcher._persist_tier_fields(
+            {"1": {"planTier": "Pro"}, "2": {"planTier": "Max 5x"}},
+            {"1": ("someone-else@example.com", ""), "2": ("account2@example.com", "")},
+        )
+        assert "planTier" not in _record(switcher, "1")
+        assert _record(switcher, "2")["planTier"] == "Max 5x"
+
+    def test_status_reflects_a_tier_cached_in_the_same_call(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(USAGE_WITH_FABLE, access_token="sk-a")), \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile",
+                   return_value=oauth.ProfileOutcome(MAX_20X)):
+            payload = switcher.status(json_output=True)
+        assert payload["active"]["planTier"] == "Max 20x"
+        assert payload["active"]["fableAccess"] is True
+
+        # text form, on a fresh roster (usage now cached, tier not yet)
+        data = json.loads(switcher.sequence_file.read_text())
+        for rec in data["accounts"].values():
+            for key in plan_tier.RECORD_KEYS:
+                rec.pop(key, None)
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._usage_store._write_rows({})  # force a fresh fetch
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(USAGE_NO_FABLE, access_token="sk-a")), \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile",
+                   return_value=oauth.ProfileOutcome(TEAM_STANDARD)):
+            switcher.status()
+        assert "[Team standard · no Fable]" in capsys.readouterr().out
+
+    def test_refresh_prefers_a_live_session_credential(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """An inactive slot run under `cswap run` holds its newest token in
+        the session profile; the backup is a consumed generation."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        expired_backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1}})
+        session = json.dumps({"claudeAiOauth": {"accessToken": "sk-session", "expiresAt": 4_000_000_000_000}})
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=expired_backup), \
+             patch("claude_swap.switcher.ClaudeAccountSwitcher._session_dir",
+                   return_value=temp_home / "sess"), \
+             patch("claude_swap.session.read_session_credentials",
+                   side_effect=lambda d: session), \
+             patch("claude_swap.session.session_identity_drifted", return_value=False), \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile",
+                   return_value=oauth.ProfileOutcome(TEAM_PREMIUM)) as profile_mock:
+            probed = switcher.refresh_plan_tiers(switcher._build_accounts_info())
+        assert probed == {"1", "2"}
+        tokens = sorted(c.args[0] for c in profile_mock.call_args_list)
+        assert tokens == ["sk-active", "sk-session"]
+        assert _record(switcher, "2")["planTier"] == "Team premium"
+
     def test_probe_on_add_skips_expired_token(self, temp_home: Path, sample_sequence_data: dict):
         switcher = ClaudeAccountSwitcher()
         _seed(switcher, sample_sequence_data)
         expired = json.dumps({"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1}})
         with patch("claude_swap.oauth.fetch_oauth_plan_profile") as m:
-            switcher._probe_plan_tier("1", expired)
+            assert switcher._probe_plan_tier("1", expired) is False
         m.assert_not_called()
         assert "planTier" not in _record(switcher, "1")
 
@@ -594,7 +708,7 @@ class TestCollectorPersistsTier:
         _seed(switcher, sample_sequence_data)
         with patch("claude_swap.oauth.fetch_oauth_plan_profile",
                    return_value=oauth.ProfileOutcome(ENTERPRISE)) as m:
-            switcher._probe_plan_tier("1", ACTIVE)
+            assert switcher._probe_plan_tier("1", ACTIVE) is True
         m.assert_called_once_with("sk-active")
         assert _record(switcher, "1")["planTier"] == "Enterprise"
 
@@ -734,4 +848,7 @@ class TestFetchRecordInMemoryFields:
         fields = ClaudeAccountSwitcher._tier_fields_from_record(
             FetchRecord(usage=USAGE_NO_FABLE, profile=oauth.ProfileOutcome({"account": {"uuid": "x"}})), 0.0
         )
-        assert fields == {"fableAccess": False, "tierError": "no-tier-fields"}
+        assert fields["fableAccess"] is False
+        assert fields["tierError"] == "no-tier-fields"
+        assert fields["tierAttemptedAt"] == "1970-01-01T00:00:00Z"
+        assert "planTier" not in fields
