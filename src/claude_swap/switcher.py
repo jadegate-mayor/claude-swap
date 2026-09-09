@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, plan_tier
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -1764,6 +1764,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    **self._tier_snapshot_fields(seq_data, n),
                 )
             )
         return AccountsSnapshot(
@@ -1771,6 +1772,21 @@ class ClaudeAccountSwitcher:
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
         )
+
+    @staticmethod
+    def _tier_snapshot_fields(seq_data: dict, account_num: str) -> dict:
+        """``AccountSnapshot`` tier kwargs from an already-loaded roster."""
+        record = seq_data.get("accounts", {}).get(str(account_num))
+        if not isinstance(record, dict):
+            return {}
+        tier = record.get("planTier")
+        access = record.get("fableAccess")
+        err = record.get("tierError")
+        return {
+            "plan_tier": tier if isinstance(tier, str) and tier else None,
+            "fable_access": access if isinstance(access, bool) else None,
+            "tier_error": err if isinstance(err, str) and err else None,
+        }
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
@@ -3481,6 +3497,9 @@ class ClaudeAccountSwitcher:
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
+            # Plan tier from the credential just captured (after the write,
+            # outside every lock; best effort).
+            self._probe_plan_tier(account_num, current_creds)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3637,6 +3656,9 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        # Plan tier from the credential just captured (after the write,
+        # outside every lock; best effort).
+        self._probe_plan_tier(account_num, current_creds)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4088,6 +4110,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    access_token=outcome.access_token,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4536,6 +4559,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            access_token=outcome.access_token,
         )
 
     def _resync_rotated_backup(
@@ -4768,6 +4792,7 @@ class ClaudeAccountSwitcher:
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        access_token=outcome.access_token,
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -4792,20 +4817,45 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+            access_token=outcome.access_token,
         )
 
     def _run_usage_fetches(
-        self, infos: list[tuple[int, str, str, str, bool, str, str]]
+        self,
+        infos: list[tuple[int, str, str, str, bool, str, str]],
+        profile_due: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
-        N accounts never hit the endpoint in the same instant."""
+        N accounts never hit the endpoint in the same instant.
+
+        ``profile_due`` names the slots whose plan tier is stale (see
+        ``plan_tier.tier_due``): after a SUCCESSFUL usage fetch for one of
+        them, the same worker makes one follow-up ``/api/oauth/profile`` read
+        with the token the usage endpoint just accepted and attaches the
+        outcome to the record (in-memory, never stored). Tied to a success
+        so a dead or rate-limited token never costs a second request, and
+        placed here — outside every lock — because network under a lock is
+        forbidden.
+        """
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
             idx, info = idx_info
             if idx and _FETCH_STAGGER_S:
                 time.sleep(idx * _FETCH_STAGGER_S)
-            return str(info[0]), self._fetch_account_usage(info)
+            num = str(info[0])
+            record = self._fetch_account_usage(info)
+            if (
+                num in profile_due
+                and record.access_token
+                and record.error is None
+                and record.sentinel is None
+            ):
+                record = dataclasses.replace(
+                    record,
+                    profile=oauth.fetch_oauth_plan_profile(record.access_token),
+                )
+            return num, record
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -4818,6 +4868,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        refresh_tier: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4915,7 +4966,8 @@ class ClaudeAccountSwitcher:
         if claims:
             pre = entries
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims]
+                [info_by_num[num] for num in claims],
+                profile_due=self._tier_due_slots(claims, force=refresh_tier),
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
@@ -4925,6 +4977,10 @@ class ClaudeAccountSwitcher:
             for num, record in accepted_records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
+            # Tier label + Fable flag ride on the accepted successes. Best
+            # effort by contract: the usage measurement is already committed,
+            # and a label-cache hiccup must never surface as a fetch failure.
+            self._persist_tier_from_records(accepted_records)
             entries = store.entries(identities, models)
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
@@ -4941,6 +4997,145 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    # -- plan tier (subscription tier + Fable access) ---------------------
+
+    def _tier_due_slots(
+        self, nums: "set[str] | dict[str, str] | list[str]", *, force: bool = False
+    ) -> set[str]:
+        """Slots whose cached plan tier is missing or older than the TTL
+        (``force`` makes every slot due — ``cswap list --refresh``)."""
+        if force:
+            return {str(n) for n in nums}
+        try:
+            data = self._get_sequence_data() or {}
+        except ClaudeSwitchError:
+            return set()
+        now = self._usage_store.clock()
+        accounts = data.get("accounts", {})
+        return {
+            str(n)
+            for n in nums
+            if plan_tier.tier_due(accounts.get(str(n)), now)
+        }
+
+    @staticmethod
+    def _tier_fields_from_record(record: FetchRecord, now: float) -> dict:
+        """Sequence-record updates one successful fetch record implies: the
+        Fable flag from its usage, and the tier (or the read's error) when a
+        profile was probed. Empty for failures and sentinels."""
+        if record.error is not None or record.sentinel is not None:
+            return {}
+        fields: dict = {}
+        fields.update(plan_tier.fable_record_fields(
+            plan_tier.fable_access(record.usage)
+        ))
+        profile = record.profile
+        if isinstance(profile, oauth.ProfileOutcome):
+            if profile.data is not None:
+                tier = plan_tier.tier_from_profile(profile.data)
+                if tier is not None:
+                    fields.update(plan_tier.tier_record_fields(tier, now))
+                else:
+                    fields.update(plan_tier.tier_error_fields("no-tier-fields"))
+            elif profile.error:
+                fields.update(plan_tier.tier_error_fields(profile.error))
+        return fields
+
+    def _persist_tier_from_records(self, records: dict[str, FetchRecord]) -> None:
+        """Write the tier/Fable facts the given successful records carry.
+        Never raises (see ``_persist_tier_fields``)."""
+        if not records:
+            return
+        now = self._usage_store.clock()
+        updates = {
+            num: fields
+            for num, record in records.items()
+            if (fields := self._tier_fields_from_record(record, now))
+        }
+        self._persist_tier_fields(updates)
+
+    def _persist_tier_fields(self, updates: dict[str, dict]) -> None:
+        """Merge per-slot tier fields into ``sequence.json`` under the account
+        lock, re-reading first so a concurrent alias/disable edit is never
+        clobbered by a stale copy. Writes only when a value changed (most
+        passes change nothing). Caller must NOT hold ``self.lock_file``.
+
+        Best effort: the label is a cache of a fact that will be re-read
+        within the TTL, so a failed write is logged and dropped rather than
+        failing the collect pass that carried it.
+        """
+        if not updates:
+            return
+        try:
+            with FileLock(self.lock_file):
+                data = self._get_sequence_data()
+                if not data:
+                    return
+                accounts = data.get("accounts", {})
+                changed = False
+                for num, fields in updates.items():
+                    record = accounts.get(str(num))
+                    if not isinstance(record, dict):
+                        continue  # slot removed since the fetch started
+                    if plan_tier.merge_record_fields(record, fields):
+                        changed = True
+                if changed:
+                    self._write_json(self.sequence_file, data)
+        except Exception as e:
+            self._logger.warning(
+                "Could not persist plan-tier fields (usage itself was recorded): %r", e
+            )
+
+    def _probe_plan_tier(self, account_num: str, creds: str) -> None:
+        """One profile read for a slot whose credential was just captured
+        (``cswap add``) or explicitly refreshed. Skipped, never refreshed,
+        when the access token is expired: consuming a grant is a coordinated
+        transition elsewhere in this class. Must NOT be called under a lock."""
+        token = oauth.extract_access_token(creds)
+        data = oauth.extract_oauth_data(creds)
+        if not token or not data or oauth.is_oauth_token_expired(data.get("expiresAt")):
+            return
+        outcome = oauth.fetch_oauth_plan_profile(token)
+        now = self._usage_store.clock()
+        fields: dict
+        if outcome.data is not None:
+            tier = plan_tier.tier_from_profile(outcome.data)
+            fields = (
+                plan_tier.tier_record_fields(tier, now)
+                if tier is not None
+                else plan_tier.tier_error_fields("no-tier-fields")
+            )
+        else:
+            fields = plan_tier.tier_error_fields(outcome.error or "unknown")
+        self._persist_tier_fields({str(account_num): fields})
+
+    def refresh_plan_tiers(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> None:
+        """Re-read every OAuth slot's plan tier now (``cswap list --refresh``),
+        independent of the usage poll's TTL/backoff gates. Slots with no
+        usable live access token are skipped (the poll path picks them up
+        after its refresh)."""
+        for num, _email, _org, _uuid, _active, creds, _alias in accounts_info:
+            if not creds or looks_like_api_key(creds):
+                continue
+            self._probe_plan_tier(str(num), creds)
+
+    def plan_tier_labels(self, *, compact: bool = True) -> dict[str, str]:
+        """Slot → rendered tier label (``"Team std · no Fable"``) for every
+        slot with a known tier — a pure file read for log lines and event
+        payloads (the auto engine's tick summary)."""
+        try:
+            data = self._get_sequence_data() or {}
+        except ClaudeSwitchError:
+            return {}
+        out: dict[str, str] = {}
+        for num, record in data.get("accounts", {}).items():
+            label = plan_tier.tier_display(record, compact=compact)
+            if label:
+                out[str(num)] = label
+        return out
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
@@ -5352,6 +5547,9 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    tier=plan_tier.tier_json_fields(
+                        seq_data.get("accounts", {}).get(str(num))
+                    ),
                 )
             )
         payload = {
@@ -5377,6 +5575,7 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        refresh: bool = False,
     ) -> dict | None:
         """List all managed accounts.
 
@@ -5385,7 +5584,8 @@ class ClaudeAccountSwitcher:
 
         ``fetch`` restricts which accounts *may* be fetched this pass (the TUI
         watch view's adaptive set); ``None`` — the CLI default — leaves every
-        stale account eligible.
+        stale account eligible. ``refresh`` re-reads every slot's plan tier
+        now instead of waiting for the 24 h TTL (``cswap list --refresh``).
         """
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
@@ -5401,7 +5601,11 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        if refresh:
+            self.refresh_plan_tiers(accounts_info)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, refresh_tier=refresh
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)
@@ -5412,6 +5616,11 @@ class ClaudeAccountSwitcher:
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
+            tier_text = plan_tier.tier_display(
+                seq_data.get("accounts", {}).get(str(num))
+            )
+            if tier_text:
+                markers += f" {muted(f'[{tier_text}]')}"
             if is_active:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
@@ -5529,6 +5738,7 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
+        active.update(plan_tier.tier_json_fields(acct))
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -5567,9 +5777,11 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
+            tier_text = plan_tier.tier_display(data["accounts"][account_num])
+            tier_part = f" {muted(f'[{tier_text}]')}" if tier_text else ""
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
+                f"({current_email} {muted(f'[{tag}]')}){tier_part}"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(

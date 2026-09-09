@@ -221,8 +221,16 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
+    tier: dict | None = None,
 ) -> dict:
-    """A full account row for ``--list``."""
+    """A full account row for ``--list``.
+
+    ``tier`` is the additive plan-tier projection
+    (``plan_tier.tier_json_fields``: ``planTier``, ``rateLimitTier``,
+    ``organizationType``, ``fableAccess``, ``tierFetchedAt``, and
+    ``tierError`` when the last profile read failed); omitted when the caller
+    has no roster record to project from.
+    """
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -240,6 +248,8 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    if tier:
+        row.update(tier)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

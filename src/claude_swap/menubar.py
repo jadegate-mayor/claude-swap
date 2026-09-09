@@ -281,11 +281,17 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    tier: str | None = None,
 ) -> str:
-    """Build one account row's menu label."""
+    """Build one account row's menu label.
+
+    ``tier`` is the compact plan-tier text (``"Max 20x"``, ``"Team std · no
+    Fable"``); rendered in brackets after the name when known.
+    """
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    tier_part = f"  [{tier}]" if tier else ""
+    return f"{num}  {label}{tier_part}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -403,6 +409,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "tiers": {},
 }
 
 
@@ -411,7 +418,9 @@ def _adapt_snapshot(snap) -> dict:
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "tiers": {num: compact tier label}}``
+    (``tiers`` is additive — the tuple rows are unchanged — and lists only
+    accounts with a known tier). The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
@@ -420,8 +429,12 @@ def _adapt_snapshot(snap) -> dict:
     active_email = None
     active_usage = None
     active_alias = None
+    tiers: dict = {}
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
+        tier = getattr(acc, "tier_label_compact", None)
+        if tier:
+            tiers[acc.number] = tier
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
@@ -435,6 +448,7 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "tiers": tiers,
     }
 
 
@@ -678,7 +692,8 @@ def run(switcher) -> int:
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        tier=self.snapshot.get("tiers", {}).get(num),
                     ),
                     callback=self._make_switch_to(num),
                 )

@@ -158,6 +158,7 @@ class TestCLI:
         switcher_cls.return_value.list_accounts.assert_called_once_with(
             show_token_status=True,
             json_output=False,
+            refresh=False,
         )
 
     def test_strategy_best_requires_switch(self, capsys):
@@ -895,7 +896,7 @@ class TestSubcommandAliases:
             switcher_cls.return_value.list_accounts.return_value = payload
             cli.main()
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, refresh=False,
         )
 
     def test_run_subcommand_still_dispatches(self):
@@ -965,7 +966,7 @@ class TestJsonOutputCli:
             cli.main()
 
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, refresh=False,
         )
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text

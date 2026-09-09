@@ -291,6 +291,50 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
 
 
+@dataclass(frozen=True)
+class ProfileOutcome:
+    """Result of a plan-tier profile read (``GET /api/oauth/profile``).
+
+    ``data`` is the raw response body on success (the caller parses the tier
+    with :func:`claude_swap.plan_tier.tier_from_profile`); ``error`` is a
+    ``_classify_usage_error`` kind on failure (``"http-401"`` marks a dead
+    access token — the one failure that changes what the user is shown).
+    """
+
+    data: dict | None
+    error: str | None = None
+
+
+def fetch_oauth_plan_profile(access_token: str, timeout_s: float = 5.0) -> ProfileOutcome:
+    """Read the profile for its plan-tier fields, never refreshing a token.
+
+    Separate from :func:`fetch_oauth_profile` (the identity oracle, which
+    keeps only ``uuid``/``email``/``organizationUuid``) because the two
+    callers want opposite failure shapes: identity wants "None means
+    unresolvable, proceed", tier wants the error kind so a 401 can be shown
+    distinctly from a network blip and a transient failure can keep the
+    cached label. Must not be called while any credential/config lock is
+    held (network under locks is forbidden). Never raises.
+    """
+    url = "https://api.anthropic.com/api/oauth/profile"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # HTTPError, URLError, timeout, JSON
+        kind, _ = _classify_usage_error(e)
+        _logger.debug("OAuth plan-profile fetch failed: %s (%r)", kind, e)
+        return ProfileOutcome(None, error=kind)
+    if not isinstance(data, dict):
+        return ProfileOutcome(None, error="bad-response")
+    return ProfileOutcome(data)
+
+
 
 def build_token_status(credentials: str) -> str | None:
     """Return a short debug summary of stored OAuth token state."""
@@ -579,6 +623,12 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # The access token the server just ACCEPTED (set only on a successful
+    # round trip). Lets the collector make one follow-up read — the
+    # plan-tier profile — with a token known to be live, including after a
+    # refresh inside this call rotated the credential the caller passed.
+    # In-memory only; never persisted or logged.
+    access_token: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -671,7 +721,7 @@ def try_fetch_usage_for_account(
 
     try:
         data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return UsageOutcome(build_usage_result(data), access_token=access_token)
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -720,7 +770,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return UsageOutcome(build_usage_result(data), access_token=new_token)
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
