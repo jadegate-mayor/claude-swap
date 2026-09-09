@@ -665,9 +665,14 @@ def _model_window_state(usage: dict | str | None, models: Sequence[str]) -> str:
     named = _named_models(models)
     if not named:
         return "present"
-    if not isinstance(usage, dict) or not oauth.relevant_windows(usage, ()):
+    if not isinstance(usage, dict):
         return "unknown"
-    return "present" if _model_windows(usage, named) else "missing"
+    if _model_windows(usage, named):
+        # Presence is checked first: a payload carrying the model window but
+        # no 5h/7d data (a shape the API can return, and one account_headroom
+        # already measures) is evidence FOR the window, not a failed read.
+        return "present"
+    return "missing" if oauth.relevant_windows(usage, ()) else "unknown"
 
 
 def _model_window_reset_ts(
@@ -813,6 +818,7 @@ class AutoSwitchEngine:
         # not one fetch read thrice.
         self._model_window_missing_reads = 0
         self._model_window_missing_fetch_ts: float | None = None
+        self._model_window_missing_account: str | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -1132,24 +1138,8 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             missing_reads = self._count_active_model_window(usage, entries, current)
-            if missing_reads and missing_reads < settings.unhealthy_ticks:
-                # Not yet: one or two reads without the window are what a
-                # transient API hiccup looks like. Hold, and say how far the
-                # count is, so the log shows the guard working rather than
-                # an idle engine.
-                self._emit(
-                    NoSwitchEvent(
-                        reason=MODEL_WINDOW_MISSING,
-                        detail=(
-                            f"active account reports no {self._model_label} "
-                            f"window; {missing_reads}/{settings.unhealthy_ticks} "
-                            "reads before it is treated as at its limit"
-                        ),
-                    )
-                )
-                return TickOutcome.NO_ACTION
             utilization = 100.0 - active_headroom
-            if missing_reads:
+            if missing_reads >= settings.unhealthy_ticks:
                 # The active seat can no longer serve the configured model.
                 # Its 5h/7d headroom is irrelevant to a session pinned to that
                 # model, so this is an at-limit escape: no cooldown, no
@@ -1165,7 +1155,28 @@ class AutoSwitchEngine:
                     )
                 )
                 trigger = "at-limit"
-            elif utilization < settings.threshold:
+            elif utilization >= settings.threshold:
+                # Independently measured on the account-wide windows: the
+                # missing-window confirmation below delays only ITS OWN
+                # trigger, never a switch the existing policy already owes.
+                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+            elif missing_reads:
+                # Not yet: one or two reads without the window are what a
+                # transient API hiccup looks like. Hold, and say how far the
+                # count is, so the log shows the guard working rather than
+                # an idle engine.
+                self._emit(
+                    NoSwitchEvent(
+                        reason=MODEL_WINDOW_MISSING,
+                        detail=(
+                            f"active account reports no {self._model_label} "
+                            f"window; {missing_reads}/{settings.unhealthy_ticks} "
+                            "reads before it is treated as at its limit"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            else:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1184,8 +1195,6 @@ class AutoSwitchEngine:
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
-            else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1297,7 +1306,9 @@ class AutoSwitchEngine:
             # Refetch before choosing where to land. The active row is left
             # as read: it is the evidence that fired.
             entries = self.switcher.usage_entries_by_account(
-                fetch=set(oauth_candidates)
+                fetch=self._without_planned_exhausted(
+                    set(oauth_candidates), entries, usage, self.clock()
+                )
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
@@ -2305,22 +2316,9 @@ class AutoSwitchEngine:
             # switch decision, but a decision-trusted exhausted row cannot be
             # a target. Preserve any wider post-429 plan instead of refetching
             # that token at the bounded all-exhausted wake cadence.
-            for num in tuple(escalation_fetch):
-                entry = entries.get(num)
-                value = usage.get(num)
-                planned_headroom = oauth.account_headroom(
-                    value if isinstance(value, dict) else None, self._models
-                )
-                if (
-                    entry is not None
-                    and entry.next_poll_at is not None
-                    and now < entry.next_poll_at
-                    and (entry.poll_interval_s or 0.0)
-                    > poll_policy.EXHAUSTED_INTERVAL_S
-                    and planned_headroom is not None
-                    and planned_headroom <= 0
-                ):
-                    escalation_fetch.remove(num)
+            escalation_fetch = self._without_planned_exhausted(
+                escalation_fetch, entries, usage, now
+            )
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
@@ -2328,6 +2326,38 @@ class AutoSwitchEngine:
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _without_planned_exhausted(
+        self,
+        fetch: set[str],
+        entries: dict,
+        usage: dict[str, dict | str | None],
+        now: float,
+    ) -> set[str]:
+        """Drop from an unscheduled fetch set every row a decision already
+        trusts as exhausted whose persisted plan is wider than the exhausted
+        cadence (a post-429 plan) and not yet due. Refetching such a row
+        cannot produce a target and would defeat the learned
+        congestion-control interval. Shared by the escalation fetch and the
+        model-window-lost refetch so both honour the same exclusion."""
+        fetch = set(fetch)
+        for num in tuple(fetch):
+            entry = entries.get(num)
+            value = usage.get(num)
+            planned_headroom = oauth.account_headroom(
+                value if isinstance(value, dict) else None, self._models
+            )
+            if (
+                entry is not None
+                and entry.next_poll_at is not None
+                and now < entry.next_poll_at
+                and (entry.poll_interval_s or 0.0)
+                > poll_policy.EXHAUSTED_INTERVAL_S
+                and planned_headroom is not None
+                and planned_headroom <= 0
+            ):
+                fetch.remove(num)
+        return fetch
 
     def _perform(
         self,
@@ -2481,7 +2511,8 @@ class AutoSwitchEngine:
         sentinel, or no window data at all) neither counts nor resets — it is
         absence of evidence, and the count waits for the next real read; and
         a read is counted once per ``fetched_at``, so a stored snapshot
-        served across several ticks is one read, not several. The measured
+        served across several ticks is one read, not several. The count is
+        also per account: a change of active seat starts it over. The measured
         case this guards: on 2026-09-09/10 two pool seats' Fable windows
         vanished within a day (81% → none, 45% → none) when their
         organization's credits ran out; each seat kept reading as 5h/7d room
@@ -2489,6 +2520,13 @@ class AutoSwitchEngine:
         """
         if not self._named_models:
             return 0
+        if current != self._model_window_missing_account:
+            # Observations belong to ONE account. A manual `cswap switch`
+            # (or our own) must not let the new seat inherit the old seat's
+            # count and trip on its first read.
+            self._model_window_missing_reads = 0
+            self._model_window_missing_fetch_ts = None
+            self._model_window_missing_account = current
         state = _model_window_state(usage.get(current), self._named_models)
         if state == "present":
             self._model_window_missing_reads = 0

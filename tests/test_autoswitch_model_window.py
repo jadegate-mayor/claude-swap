@@ -19,6 +19,7 @@ credits ran out; each time Claude Code offered a fallback model.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -468,3 +469,104 @@ class TestPR321ScenarioIsNotWorse:
         assert h.active_number() == 2
         assert _switch(h).trigger == "at-limit"
         assert _poll(h).skipped == ({"4": MODEL_WINDOW_MISSING} if windowless_seat else {})
+
+
+class TestReviewRoundOne:
+    """Findings from the first review round, each pinned."""
+
+    def test_hard_limit_escape_is_not_delayed_by_the_confirmation(self, temp_home):
+        # P1: the active is at 5h 100% AND reports no window on its FIRST
+        # missing read. The at-limit escape is owed on the account-wide
+        # measurement alone; the missing-window confirmation gates only its
+        # own trigger.
+        h = _harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _seat(five_h=100, seven_d=30),
+            "2": _seat(five_h=0, seven_d=0),      # no window: still refused
+            "3": _seat(five_h=40, fable=50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert _switch(h).trigger == "at-limit"
+        assert MODEL_WINDOW_MISSING not in _reasons(h)
+        assert not any(isinstance(e, ModelWindowLostEvent) for e in h.events)
+
+    def test_proactive_switch_is_not_delayed_either(self, temp_home):
+        h = _harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _seat(five_h=92, seven_d=30),    # over the bar on 5h, no window
+            "2": _seat(five_h=0, seven_d=0),
+            "3": _seat(five_h=40, fable=50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert _switch(h).trigger == "proactive"
+
+    def test_missing_reads_do_not_carry_over_to_another_account(self, temp_home):
+        # P2: two missing reads on #1, then a manual switch to #2 — #2's first
+        # missing read is 1/3, not 3/3.
+        h = _harness(temp_home, model="Fable")
+        gone = _seat(five_h=52, seven_d=30)
+        fleet = {"1": gone, "2": gone, "3": _seat(five_h=40, fable=50)}
+        for _ in range(2):
+            h.clock.advance(300)
+            assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert "2/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
+        h.switcher.switch_to("2", json_output=True)
+        assert h.active_number() == 2
+        h.clock.advance(300)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert "1/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
+
+    def test_lost_window_refetch_honours_a_post_429_exhausted_plan(self, temp_home):
+        # P2: an exhausted candidate whose persisted plan is wider than the
+        # exhausted cadence and not yet due is left out of the refetch, as
+        # the escalation fetch already leaves it out.
+        from claude_swap import poll_policy
+
+        h = _harness(temp_home, model="Fable")
+        gone = _seat(five_h=52, seven_d=30)
+        now = h.clock.now
+        exhausted = replace(
+            _entry_for(_seat(five_h=100, fable=100), now),
+            next_poll_at=now + 5 * H,
+            poll_interval_s=poll_policy.EXHAUSTED_INTERVAL_S * 4,
+        )
+        entries = {
+            "1": _entry_for(gone, now),
+            "2": exhausted,
+            "3": _entry_for(_seat(five_h=40, fable=50), now),
+        }
+        for _ in range(2):
+            h.clock.advance(300)
+            entries["1"] = _entry_for(gone, h.clock.now)
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        h.clock.advance(300)
+        entries["1"] = _entry_for(gone, h.clock.now)
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as fetch:
+            assert h.engine.tick() is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        fetched = [c.kwargs.get("fetch") for c in fetch.call_args_list]
+        assert {"3"} in fetched and {"2", "3"} not in fetched
+
+    def test_scoped_only_payload_counts_as_present_and_resets(self, temp_home):
+        # P2: a payload with the Fable window but no 5h/7d data is evidence
+        # FOR the window — present, and it resets the count.
+        scoped_only = {"scoped": [{"name": "Fable", "pct": 40.0}]}
+        assert _model_window_state(scoped_only, ("Fable",)) == "present"
+        h = _harness(temp_home, model="Fable")
+        gone = _seat(five_h=52, seven_d=30)
+        fleet = {"1": gone, "2": _seat(five_h=0, seven_d=0), "3": _seat(five_h=40, fable=50)}
+        for _ in range(2):
+            h.clock.advance(300)
+            assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        h.clock.advance(300)
+        assert h.tick_with_usage({**fleet, "1": scoped_only}) is TickOutcome.NO_ACTION
+        assert _reasons(h)[-1] == "below-threshold"
+        h.clock.advance(300)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "1/3 reads" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
