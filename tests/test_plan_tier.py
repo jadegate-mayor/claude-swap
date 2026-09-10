@@ -919,6 +919,26 @@ class TestTickLine:
         assert ev.human().endswith("| others: #2: 10%")
         assert "planTiers" not in ev._fields()
 
+    def test_tier_label_and_skip_marker_render_together(self):
+        # jadegate-integration seam: the ranking branch's skip marker and the
+        # label branch's tier suffix decorate the same candidate. Both must
+        # render, tier first, and both additive JSON key sets must be present.
+        ev = PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 60.0, "2": 90.0, "3": 40.0},
+            threshold=90.0,
+            windows={"2": {"5h": 10.0, "7d": 5.0}, "3": {"5h": 5.0, "7d": 10.0, "Fable": 60.0}},
+            tiers={"2": "Team std · no Fable", "3": "Max 20x"},
+            skipped={"2": "model-window-missing"},
+        )
+        line = ev.human()
+        assert "#2: 5h 10% · 7d 5% · Team std · no Fable (skipped: model-window-missing)" in line
+        assert "#3: 5h 5% · 7d 10% · Fable 60% · Max 20x" in line
+        assert "skipped" not in line.split("#3:")[1]
+        payload = ev.to_json()
+        assert payload["planTiers"] == {"2": "Team std · no Fable", "3": "Max 20x"}
+        assert payload["skippedCandidates"] == {"2": "model-window-missing"}
+
 
 class TestFetchRecordInMemoryFields:
     def test_defaults_and_replace(self):
