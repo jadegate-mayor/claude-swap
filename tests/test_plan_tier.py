@@ -30,18 +30,18 @@ from claude_swap.usage_store import FetchRecord, UsageEntry
 # Fake profile payloads — one per observed tier row, plus the documented extras
 # --------------------------------------------------------------------------- #
 def _profile(tier: str | None, org_type: str | None, *, has_max=False, has_pro=False) -> dict:
-    org: dict = {"uuid": "org-1", "name": "Org", "billing_type": "stripe_subscription"}
+    """A profile body with the tier fields only. Identity fields (account
+    uuid/email, organization uuid) are deliberately absent so one payload can
+    stand in for every seeded slot — the identity guard treats absent fields
+    as proving nothing. The guard itself is exercised with explicit
+    identities in ``test_persist_drops_a_profile_that_names_another_account``."""
+    org: dict = {"name": "Org", "billing_type": "stripe_subscription"}
     if tier is not None:
         org["rate_limit_tier"] = tier
     if org_type is not None:
         org["organization_type"] = org_type
     return {
-        "account": {
-            "uuid": "acct-1",
-            "email": "user@example.com",
-            "has_claude_max": has_max,
-            "has_claude_pro": has_pro,
-        },
+        "account": {"has_claude_max": has_max, "has_claude_pro": has_pro},
         "organization": org,
     }
 
@@ -636,6 +636,65 @@ class TestCollectorPersistsTier:
         assert "planTier" not in _record(switcher, "1")
         assert _record(switcher, "2")["planTier"] == "Max 5x"
 
+    def test_persist_drops_a_profile_that_names_another_account(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Foreign live credential under this slot's config: the profile
+        describes account B, and B's tier must not be cached on A."""
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)  # slot 1 uuid-1 / account1@example.com
+        foreign = dict(TEAM_PREMIUM)
+        foreign["account"] = {**TEAM_PREMIUM["account"], "uuid": "uuid-OTHER", "email": "account1@example.com"}
+        fields = ClaudeAccountSwitcher._tier_fields_from_record(
+            FetchRecord(usage=USAGE_WITH_FABLE, profile=oauth.ProfileOutcome(foreign)), 0.0
+        )
+        assert fields[plan_tier.PROFILE_IDENTITY_KEY]["uuid"] == "uuid-OTHER"
+        switcher._persist_tier_fields({"1": fields})
+        assert "planTier" not in _record(switcher, "1")
+        assert "fableAccess" not in _record(switcher, "1")
+        # matching identity (same uuid, email case-folded) is accepted, and the
+        # private key never reaches the roster
+        ok = dict(TEAM_PREMIUM)
+        ok["account"] = {**TEAM_PREMIUM["account"], "uuid": "uuid-1", "email": "Account1@Example.com"}
+        fields = ClaudeAccountSwitcher._tier_fields_from_record(
+            FetchRecord(usage=USAGE_WITH_FABLE, profile=oauth.ProfileOutcome(ok)), 0.0
+        )
+        switcher._persist_tier_fields({"1": fields})
+        rec = _record(switcher, "1")
+        assert rec["planTier"] == "Team premium"
+        assert plan_tier.PROFILE_IDENTITY_KEY not in rec
+        # a profile with no identity block proves nothing and is accepted
+        assert not plan_tier.identity_disagrees({}, rec)
+        assert not plan_tier.identity_disagrees({"uuid": None, "organizationUuid": None, "email": None}, rec)
+
+    def test_refresh_retries_after_a_401_probe_once_the_token_recovers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Locally unexpired but server-rejected token: the direct probe 401s,
+        the collect pass refreshes and re-probes with the accepted token, and
+        the healthy account does not sit on `tier: re-login needed`."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+
+        def profile(token, timeout_s=5.0):
+            if token == "sk-backup":
+                return oauth.ProfileOutcome(None, error="http-401")
+            return oauth.ProfileOutcome(TEAM_PREMIUM)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=BACKUP), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(USAGE_WITH_FABLE, access_token="sk-refreshed")), \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile", side_effect=profile) as profile_mock:
+            switcher.list_accounts(refresh=True)
+        tokens = [c.args[0] for c in profile_mock.call_args_list]
+        assert tokens.count("sk-backup") == 1 and tokens.count("sk-refreshed") == 1
+        rec = _record(switcher, "2")
+        assert rec["planTier"] == "Team premium"
+        assert rec["tierError"] is None
+
     def test_status_reflects_a_tier_cached_in_the_same_call(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
@@ -824,6 +883,17 @@ class TestTickLine:
         assert "#2: 5h 10% · 7d 5% · Team std · no Fable" in line
         assert "#3: ? (http-429) · Max 20x" in line
         assert ev._fields()["planTiers"] == {"2": "Team std · no Fable", "3": "Max 20x"}
+
+    def test_active_account_tier_in_human_line(self):
+        ev = PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 60.0},
+            threshold=90.0,
+            tiers={"1": "Team std · no Fable"},
+        )
+        assert ev.human().startswith(
+            "Account-1 (a@x.com): 40% used · Team std · no Fable (switch at 90%)"
+        )
 
     def test_no_tiers_leaves_line_and_json_unchanged(self):
         ev = PollEvent(active={"number": 1, "email": "a@x.com"}, headroom={"1": 60.0, "2": 90.0}, threshold=90.0)

@@ -217,6 +217,53 @@ def _parse_iso(value: object) -> float | None:
         return None
 
 
+#: Private key carried on a fields dict from the profile reader to the
+#: persist step: the identity the PROFILE reported, checked against the slot
+#: under the lock and never written. See ``profile_identity``.
+PROFILE_IDENTITY_KEY = "_profileIdentity"
+
+
+def profile_identity(data: object) -> dict:
+    """``{"uuid", "organizationUuid", "email"}`` as the profile body names
+    them (each None when absent). A partial credential/config sync can leave
+    account B's live token under account A's config; the profile then
+    describes B, and its tier must not be cached on A."""
+    if not isinstance(data, dict):
+        return {}
+    acct = data.get("account")
+    org = data.get("organization")
+    acct = acct if isinstance(acct, dict) else {}
+    org = org if isinstance(org, dict) else {}
+    return {
+        "uuid": _str_or_none(acct.get("uuid")),
+        "organizationUuid": _str_or_none(org.get("uuid")),
+        "email": _str_or_none(acct.get("email")),
+    }
+
+
+def identity_disagrees(profile_ident: dict, record: dict) -> bool:
+    """True when the profile names a DIFFERENT account than the roster
+    record: any field present on both sides and unequal (uuid, org uuid,
+    or email — email case-insensitively). Absent fields prove nothing."""
+    if not profile_ident:
+        return False
+    for key, rec_key, fold in (
+        ("uuid", "uuid", False),
+        ("organizationUuid", "organizationUuid", False),
+        ("email", "email", True),
+    ):
+        seen = profile_ident.get(key)
+        have = record.get(rec_key)
+        if not isinstance(seen, str) or not isinstance(have, str) or not have.strip():
+            continue
+        a, b = seen.strip(), have.strip()
+        if fold:
+            a, b = a.lower(), b.lower()
+        if a != b:
+            return True
+    return False
+
+
 def tier_record_fields(tier: PlanTier, now: float) -> dict:
     """Sequence-record fields for a freshly fetched tier (camelCase, like the
     rest of the record). Clears ``tierError`` — a successful read supersedes
@@ -355,9 +402,12 @@ __all__ = [
     "PlanTier",
     "RECORD_KEYS",
     "RELOGIN_TIER_TEXT",
+    "PROFILE_IDENTITY_KEY",
     "TIER_RETRY_S",
     "TIER_TTL_S",
     "fable_access",
+    "identity_disagrees",
+    "profile_identity",
     "fable_record_fields",
     "format_tier",
     "merge_record_fields",

@@ -5045,6 +5045,7 @@ class ClaudeAccountSwitcher:
                     fields.update(plan_tier.tier_record_fields(tier, now))
                 else:
                     fields.update(plan_tier.tier_error_fields("no-tier-fields", now))
+                fields[plan_tier.PROFILE_IDENTITY_KEY] = plan_tier.profile_identity(profile.data)
             elif profile.error:
                 fields.update(plan_tier.tier_error_fields(profile.error, now))
         return fields
@@ -5109,6 +5110,18 @@ class ClaudeAccountSwitcher:
                             "dropping its tier update", num,
                         )
                         continue
+                    fields = dict(fields)
+                    seen = fields.pop(plan_tier.PROFILE_IDENTITY_KEY, None)
+                    if isinstance(seen, dict) and plan_tier.identity_disagrees(seen, record):
+                        # The profile describes another account (a foreign
+                        # live credential under this slot's config): its
+                        # tier is not this slot's. Drop the whole update —
+                        # the usage that came with it is equally foreign.
+                        self._logger.debug(
+                            "Profile for slot %s names a different account; "
+                            "dropping its tier update", num,
+                        )
+                        continue
                     if plan_tier.merge_record_fields(record, fields):
                         changed = True
                 if changed:
@@ -5144,13 +5157,18 @@ class ClaudeAccountSwitcher:
                 if tier is not None
                 else plan_tier.tier_error_fields("no-tier-fields", now)
             )
+            fields[plan_tier.PROFILE_IDENTITY_KEY] = plan_tier.profile_identity(outcome.data)
         else:
             fields = plan_tier.tier_error_fields(outcome.error or "unknown", now)
         self._persist_tier_fields(
             {str(account_num): fields},
             {str(account_num): identity} if identity is not None else None,
         )
-        return True
+        # A server-rejected token is not a finished probe: the collect pass
+        # may refresh it and probe again with the accepted replacement, so
+        # the caller must keep the slot in its follow-up set rather than
+        # leave a "re-login needed" note standing for the retry interval.
+        return outcome.error != "http-401"
 
     def _probe_credential_for(
         self, num: str, email: str, org_uuid: str, is_active: bool, creds: str

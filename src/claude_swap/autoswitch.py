@@ -358,6 +358,9 @@ class PollEvent(AutoSwitchEvent):
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
+        tier = self.tiers.get(str(num))
+        if tier:
+            used = f"{used} · {tier}"
         others = ", ".join(
             f"#{n}: {self._describe(n)}"
             for n in self.headroom
