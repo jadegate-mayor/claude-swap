@@ -667,6 +667,25 @@ class TestCollectorPersistsTier:
         assert not plan_tier.identity_disagrees({}, rec)
         assert not plan_tier.identity_disagrees({"uuid": None, "organizationUuid": None, "email": None}, rec)
 
+    def test_identity_compare_is_uuid_first(self):
+        rec = {"uuid": "u-1", "organizationUuid": "o-1", "email": "old@example.com"}
+        # same uuid, changed email: the same account (an address change)
+        assert not plan_tier.identity_disagrees(
+            {"uuid": "u-1", "organizationUuid": "o-1", "email": "new@example.com"}, rec
+        )
+        # same uuid under a different org: another account
+        assert plan_tier.identity_disagrees(
+            {"uuid": "u-1", "organizationUuid": "o-2", "email": "old@example.com"}, rec
+        )
+        # different uuid, same email (recycled address): another account
+        assert plan_tier.identity_disagrees(
+            {"uuid": "u-2", "organizationUuid": "o-1", "email": "old@example.com"}, rec
+        )
+        # no uuid on the roster side: the email decides, case-insensitively
+        legacy = {"email": "old@example.com", "organizationUuid": "o-1"}
+        assert not plan_tier.identity_disagrees({"uuid": "u-1", "email": "OLD@example.com"}, legacy)
+        assert plan_tier.identity_disagrees({"uuid": "u-1", "email": "other@example.com"}, legacy)
+
     def test_refresh_retries_after_a_401_probe_once_the_token_recovers(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):

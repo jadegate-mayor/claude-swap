@@ -241,27 +241,38 @@ def profile_identity(data: object) -> dict:
     }
 
 
+def _both(profile_ident: dict, record: dict, key: str) -> tuple[str, str] | None:
+    seen = profile_ident.get(key)
+    have = record.get(key)
+    if not isinstance(seen, str) or not isinstance(have, str):
+        return None
+    seen, have = seen.strip(), have.strip()
+    if not seen or not have:
+        return None
+    return seen, have
+
+
 def identity_disagrees(profile_ident: dict, record: dict) -> bool:
-    """True when the profile names a DIFFERENT account than the roster
-    record: any field present on both sides and unequal (uuid, org uuid,
-    or email — email case-insensitively). Absent fields prove nothing."""
+    """True when the profile names a DIFFERENT account than the roster record.
+
+    UUID first, like the switcher's own ``_resolved_matches_slot_identity``:
+    account uuids are stable where an email can change (or be recycled), so
+    when both sides carry a uuid it decides and the email is not consulted
+    — an account that changed its address keeps its tier. The organization
+    uuid is corroborated on either arm (a uuid match under a disagreeing org
+    is another account). Only without a uuid to compare does the email
+    (case-insensitively) decide. Absent fields prove nothing.
+    """
     if not profile_ident:
         return False
-    for key, rec_key, fold in (
-        ("uuid", "uuid", False),
-        ("organizationUuid", "organizationUuid", False),
-        ("email", "email", True),
-    ):
-        seen = profile_ident.get(key)
-        have = record.get(rec_key)
-        if not isinstance(seen, str) or not isinstance(have, str) or not have.strip():
-            continue
-        a, b = seen.strip(), have.strip()
-        if fold:
-            a, b = a.lower(), b.lower()
-        if a != b:
-            return True
-    return False
+    org = _both(profile_ident, record, "organizationUuid")
+    if org is not None and org[0] != org[1]:
+        return True
+    uuid = _both(profile_ident, record, "uuid")
+    if uuid is not None:
+        return uuid[0] != uuid[1]
+    email = _both(profile_ident, record, "email")
+    return email is not None and email[0].lower() != email[1].lower()
 
 
 def tier_record_fields(tier: PlanTier, now: float) -> dict:
