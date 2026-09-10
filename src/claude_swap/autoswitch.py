@@ -335,6 +335,11 @@ class PollEvent(AutoSwitchEvent):
     # model configured, a seat with room on 5h/7d but no window for that
     # model is skipped, and the line that shows the room has to say so.
     skipped: dict[str, str] = field(default_factory=dict)
+    # account number → compact plan-tier label ("Team std · no Fable") for
+    # accounts whose tier is known. Additive field: a seat that lost its
+    # Fable window used to be indistinguishable from an incomplete snapshot
+    # in the tick line.
+    tiers: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -348,21 +353,26 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.skipped:
             fields["skippedCandidates"] = self.skipped
+        if self.tiers:
+            fields["planTiers"] = self.tiers
         return fields
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            text = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            body = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
         else:
             h = self.headroom.get(num)
             if h is not None:
-                text = f"{100 - h:.0f}%"
+                body = f"{100 - h:.0f}%"
             else:
                 err = self.fetch_errors.get(num)
-                text = f"? ({err})" if err else "?"
+                body = f"? ({err})" if err else "?"
+        tier = self.tiers.get(num)
+        if tier:
+            body = f"{body} · {tier}"
         skip = self.skipped.get(num)
-        return f"{text} (skipped: {skip})" if skip else text
+        return f"{body} (skipped: {skip})" if skip else body
 
     def human(self) -> str:
         if self.active is None:
@@ -374,6 +384,9 @@ class PollEvent(AutoSwitchEvent):
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
+        tier = self.tiers.get(str(num))
+        if tier:
+            used = f"{used} · {tier}"
         others = ", ".join(
             f"#{n}: {self._describe(n)}"
             for n in self.headroom
@@ -1114,6 +1127,7 @@ class AutoSwitchEngine:
                         and self.switcher.account_kind_for(n) != "api_key"
                     ],
                 ),
+                tiers=self._plan_tier_labels(),
             )
         )
 
@@ -2200,6 +2214,17 @@ class AutoSwitchEngine:
         return [num for _, num in qualifying], any_known, active_reset_ts
 
     # -- adaptive usage scheduling ---------------------------------------------
+
+    def _plan_tier_labels(self) -> dict[str, str]:
+        """Compact tier labels for the tick line — a pure roster read, and
+        optional: a switcher double without it (tests) simply yields none."""
+        getter = getattr(self.switcher, "plan_tier_labels", None)
+        if getter is None:
+            return {}
+        try:
+            return dict(getter())
+        except Exception:  # never let a label lookup break a tick
+            return {}
 
     def _collect_scheduled_usage(
         self,

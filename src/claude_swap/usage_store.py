@@ -262,6 +262,14 @@ class FetchRecord:
     # predate the field — those strikes bind unconditionally, the legacy
     # behavior).
     struck_fp: str | None = None
+    # --- in-memory only: neither is read by ``record`` nor written to the
+    # store. ``access_token`` is the token the usage endpoint just accepted
+    # (None on failure/sentinel), so the collector can make one follow-up
+    # plan-tier profile read with a token known to be live. ``profile`` is
+    # that read's outcome (``oauth.ProfileOutcome``) when the collector
+    # asked for one this pass.
+    access_token: str | None = None
+    profile: object | None = None
 
 
 @dataclass(frozen=True)

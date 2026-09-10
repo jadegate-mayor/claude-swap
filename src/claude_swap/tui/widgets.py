@@ -179,6 +179,11 @@ def account_card_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    tier = acc.tier_label
+    if tier:
+        # Same words as `cswap list`: plan tier, then whether the seat has
+        # the Fable window — the fact a missing usage line used to hide.
+        text.append(f"  [{tier}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -258,6 +263,9 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    tier = acc.tier_label
+    if tier:
+        text.append(f"  [{tier}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")

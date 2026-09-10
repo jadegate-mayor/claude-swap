@@ -12,6 +12,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap import plan_tier as _plan_tier
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -140,11 +141,31 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # Plan tier ("Max 20x", "Team standard", ...) as cached in the account's
+    # sequence record, the Fable-window flag from the latest usage payload
+    # (None = no evidence yet), and the last profile-read error kind. All
+    # additive; see claude_swap.plan_tier.
+    plan_tier: str | None = None
+    fable_access: bool | None = None
+    tier_error: str | None = None
 
     @property
     def display_tag(self) -> str:
         """Org tag for display: the org name, or 'personal'."""
         return self.org_name if self.org_name else "personal"
+
+    @property
+    def tier_label(self) -> str | None:
+        """``"Team premium · Fable"`` — the same words ``cswap list`` prints
+        in its bracketed tier label; None when nothing is known yet."""
+        return _plan_tier.format_tier(self.plan_tier, self.fable_access, self.tier_error)
+
+    @property
+    def tier_label_compact(self) -> str | None:
+        """Menu-bar form (``"Team std · no Fable"``)."""
+        return _plan_tier.format_tier(
+            self.plan_tier, self.fable_access, self.tier_error, compact=True
+        )
 
 
 @dataclass(frozen=True)

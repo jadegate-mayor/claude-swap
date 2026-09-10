@@ -1089,6 +1089,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "Re-read every account's plan tier (Max 5x / Max 20x / Team "
+            "premium / Team standard / Pro ...) now instead of waiting for "
+            "the 24h cache (use with 'list')"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help=(
@@ -1297,6 +1306,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
+    if args.refresh and not args.list:
+        parser.error("--refresh can only be used with 'list'")
+
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
 
@@ -1387,6 +1399,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
+                refresh=args.refresh,
             )
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
