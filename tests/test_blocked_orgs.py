@@ -804,6 +804,60 @@ class TestAllEligibleSeatsBlocked:
         assert _of(h, NoSwitchEvent)[-1].reason == "cooldown"
         assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 1
 
+    def test_no_alarm_on_a_tick_that_then_fails_over_successfully(self, temp_home):
+        """Review round 2 (P2). With the active seat blocked, the unblocked
+        peer may not have been read yet when the tick starts; the refetch
+        reads it and the failover succeeds. An alarm before that switch would
+        be a false outage report."""
+        from tests.test_autoswitch import _entry_for
+
+        h = _harness(temp_home, seats=(3, 1, 4))
+        _block(h)
+        first = {"3": _seat(five_h=13), "1": None, "4": _seat(five_h=0)}
+        fresh = {**first, "1": _seat(five_h=20)}
+
+        def entries(fetch=None, **_kw):
+            rows = fresh if fetch else first
+            return {n: _entry_for(v, h.clock.now) for n, v in rows.items()}
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+            assert h.engine.tick() is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert _of(h, AllEligibleSeatsBlockedEvent) == []
+
+    def test_an_unread_unblocked_seat_is_not_evidence_of_a_dead_pool(self, temp_home):
+        h = _harness(temp_home, seats=(1, 2, 3, 4))
+        _block(h)
+        # Healthy active; adaptive polling has not read seat 2 this tick.
+        h.tick_with_usage(
+            {"1": _seat(five_h=20), "2": None, "3": _seat(five_h=1), "4": _seat(five_h=2)}
+        )
+        assert _of(h, AllEligibleSeatsBlockedEvent) == []
+        # A seat in a KNOWN unusable state is evidence.
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        h.tick_with_usage({
+            "1": _seat(five_h=20), "2": USAGE_RELOGIN_REQUIRED,
+            "3": _seat(five_h=1), "4": _seat(five_h=2),
+        })
+        assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 1
+
+    def test_an_enabled_api_key_fallback_means_the_pool_is_not_dead(self, temp_home):
+        """Review round 2 (P2)."""
+        h = _harness(temp_home, seats=(1, 3, 4), include_api_key_accounts=True)
+        _block(h)
+        usage = {"1": _seat(five_h=20), "3": _seat(five_h=1), "4": _seat(five_h=2)}
+        real_kind = h.switcher.account_kind_for
+        h.seed(2, SEATS[2][0])
+        with patch.object(
+            h.switcher, "account_kind_for",
+            side_effect=lambda n: "api_key" if str(n) == "2" else real_kind(n),
+        ):
+            h.tick_with_usage(usage)
+        assert _of(h, AllEligibleSeatsBlockedEvent) == []
+        # (The same pool WITHOUT a fallback alarms: see
+        # test_a_healthy_best_strategy_active_alarms_too.)
+
     def test_the_alarm_is_raised_once_per_tick_however_it_is_reached(self, temp_home):
         h = _harness(temp_home, seats=(3, 4))
         _block(h)

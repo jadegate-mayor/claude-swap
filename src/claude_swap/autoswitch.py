@@ -1247,7 +1247,7 @@ class AutoSwitchEngine:
             )
         )
         self._report_org_blocked(current)
-        if self._tick_org_blocked:
+        if self._tick_org_blocked and not active_org_blocked:
             # Judged HERE, before any trigger is classified: whether the pool
             # has anywhere left to go does not depend on whether this tick
             # wants to move. A healthy `best` active returns below-threshold,
@@ -1255,6 +1255,13 @@ class AutoSwitchEngine:
             # and a pool one wall away from dead is exactly when the line has
             # to be in the log already. The outcome is untouched: NO_ACTION
             # stays NO_ACTION.
+            #
+            # NOT when the active seat is itself blocked: that tick is about to
+            # refetch its possible targets and fail over, so the verdict waits
+            # for the refreshed snapshot (an alarm followed by a successful
+            # switch in the same tick is a false outage report). And not while
+            # an enabled API-key account stands behind the pool: it has no org
+            # and no window, and it is where an escape would land.
             census = [
                 n
                 for n in self.switcher.switchable_account_numbers()
@@ -1262,7 +1269,15 @@ class AutoSwitchEngine:
                 and n not in quarantined
                 and self.switcher.account_kind_for(n) != "api_key"
             ]
-            if self._all_eligible_blocked(current, usage, headroom, census):
+            api_key_fallback = settings.include_api_key_accounts and any(
+                n != current
+                and n not in quarantined
+                and self.switcher.account_kind_for(n) == "api_key"
+                for n in self.switcher.switchable_account_numbers()
+            )
+            if not api_key_fallback and self._all_eligible_blocked(
+                current, usage, headroom, census
+            ):
                 self._alarm_all_blocked(current, census)
 
         if not self._model_check_done:
@@ -2819,14 +2834,18 @@ class AutoSwitchEngine:
     ) -> bool:
         """Whether every seat that could otherwise take over is org-blocked.
 
-        True when no UNBLOCKED candidate is usable this tick (readable, real
-        headroom, serves the configured model) while the block is what stands
-        in the way: the active seat is itself blocked, or some blocked
-        candidate is not known to be unusable on its own account. A blocked
-        seat we cannot read counts as otherwise-eligible — the alarm errs
-        toward sounding. With nothing blocked this is always False, so the
-        pre-existing verdicts (all-exhausted, no-qualifying-candidate) keep
-        every case they had."""
+        True when every UNBLOCKED candidate is KNOWN to be unusable this tick
+        (at its limit, serving no configured model, or in a sentinel state
+        such as re-login-required) while the block is what stands in the way:
+        the active seat is itself blocked, or some blocked candidate is not
+        known to be unusable on its own account. An unblocked seat whose usage
+        simply has not been read — adaptive polling leaves such gaps on
+        healthy ticks, and a failed fetch looks the same — is NOT evidence:
+        the alarm claims a fact about the pool and waits until it has one
+        (the tick's own reason line already says when usage is unreadable).
+        A BLOCKED seat we cannot read does count as otherwise-eligible. With
+        nothing blocked this is always False, so the pre-existing verdicts
+        (all-exhausted, no-qualifying-candidate) keep every case they had."""
         blocked = self._tick_org_blocked
         if not blocked:
             return False
@@ -2834,6 +2853,8 @@ class AutoSwitchEngine:
         for num in oauth_candidates:
             if num in blocked or num in windowless:
                 continue
+            if usage.get(num) is None:
+                return False  # not read this tick: no verdict on the pool
             h = headroom.get(num)
             if h is not None and h > 0:
                 return False  # somewhere real to go; not the block's doing
