@@ -400,6 +400,175 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _blocked_orgs_command(action: str, argv: list[str]) -> None:
+    """Handle `cswap block-org`, `cswap unblock-org` and `cswap blocked-orgs`.
+
+    The blocked-orgs record keeps every seat of a named organization out of
+    `cswap auto`'s ranking (see ``claude_swap.blocked_orgs``). It is keyed on
+    the org label exactly as `cswap list` prints it in brackets — never the
+    email domain — and an entry never expires by itself: it is cleared here,
+    or by the watchdog with its RESOLVED evidence. Nothing here disables,
+    enables or switches a seat.
+    """
+    from claude_swap import blocked_orgs
+
+    prog = f"{_prog_name()} {action}"
+    if action == "blocked-orgs":
+        parser = argparse.ArgumentParser(
+            prog=prog,
+            description=(
+                "Show the blocked-orgs record: which organizations' seats "
+                "`cswap auto` is skipping, who wrote each entry, when and why."
+            ),
+        )
+        parser.add_argument(
+            "--init",
+            action="store_true",
+            help=(
+                "Create an empty record if none exists (run once at install: "
+                "a MISSING record is reported loudly on every auto tick)"
+            ),
+        )
+        parser.add_argument(
+            "--json", action="store_true", help="Emit the record as JSON"
+        )
+    else:
+        blocking = action == "block-org"
+        parser = argparse.ArgumentParser(
+            prog=prog,
+            description=(
+                "Keep every seat of an organization out of `cswap auto`'s "
+                "ranking until it is unblocked. No timer ever lifts it."
+                if blocking
+                else "Return an organization's seats to `cswap auto`'s ranking."
+            ),
+        )
+        parser.add_argument(
+            "label",
+            metavar="ORG",
+            help="Org label exactly as `cswap list` prints it in brackets",
+        )
+        parser.add_argument(
+            "--evidence",
+            metavar="TEXT",
+            required=blocking,
+            default="",
+            help=(
+                "The error line, or a note saying why"
+                if blocking
+                else "What resolved it (required with --by watchdog)"
+            ),
+        )
+        parser.add_argument(
+            "--by",
+            choices=blocked_orgs.WRITERS,
+            default=blocked_orgs.WRITER_HAND,
+            help="Who is writing the entry (default: hand)",
+        )
+        if blocking:
+            parser.add_argument(
+                "--force",
+                action="store_true",
+                help="Record a label that no managed account currently shows",
+            )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        backup_dir = switcher.backup_dir
+        path = blocked_orgs.record_path(backup_dir)
+
+        if action == "block-org":
+            entry = blocked_orgs.block(
+                backup_dir,
+                args.label,
+                by=args.by,
+                evidence=args.evidence,
+                known_labels=switcher.known_org_labels(),
+                force=args.force,
+            )
+            if entry.written_by != args.by:
+                print(
+                    f"{accent('Already blocked')} {entry.label} "
+                    f"{dimmed(f'(by {entry.written_by}; left as written)')}"
+                )
+            else:
+                print(f"{accent('Blocked')} {entry.label} {dimmed(f'(by {entry.written_by})')}")
+            seats = [
+                n
+                for n in switcher.switchable_account_numbers()
+                if switcher.account_org_label(n) == entry.label
+            ]
+            print(
+                dimmed(
+                    "  cswap auto skips its seats from the next tick: "
+                    + (", ".join(f"#{n}" for n in seats) or "none in rotation")
+                )
+            )
+            print(dimmed(f"  Lifted only by: {_prog_name()} unblock-org {entry.label!r}"))
+            return
+
+        if action == "unblock-org":
+            removed = blocked_orgs.unblock(
+                backup_dir, args.label, by=args.by, evidence=args.evidence
+            )
+            if removed is None:
+                error(f"Error: {args.label!r} is not blocked")
+                sys.exit(1)
+            print(f"{accent('Unblocked')} {removed.label} {dimmed(f'(by {args.by})')}")
+            return
+
+        if args.init:
+            created = blocked_orgs.init(backup_dir)
+            if not args.json:
+                print(
+                    f"{accent('Created')} {path}"
+                    if created
+                    else dimmed(f"Record already exists: {path}")
+                )
+        record = blocked_orgs.load(path)
+        if args.json:
+            payload = record.to_json()
+            payload["path"] = str(path)
+            if record.problem:
+                payload["problem"] = record.problem
+            print(json.dumps(payload, indent=2))
+            return
+        if record.problem:
+            error(
+                f"Blocked-orgs record {record.problem}: {path} — NO org is "
+                "being excluded"
+            )
+            sys.exit(1)
+        if not record.orgs:
+            print(dimmed(f"No organization is blocked ({path})"))
+            return
+        known = switcher.known_org_labels()
+        print(bolded("Blocked organizations:"))
+        for label, org in sorted(record.orgs.items()):
+            when = (
+                _time_label(org.written_at) if org.written_at else "unknown time"
+            )
+            orphan = "" if label in known else f" {dimmed('(matches no account)')}"
+            print(f"  {accent(label)}{orphan}  {dimmed(f'by {org.written_by}, {when}')}")
+            if org.evidence:
+                print(f"     {muted(org.evidence)}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _time_label(epoch: float) -> str:
+    import time as _time
+
+    return _time.strftime("%Y-%m-%d %H:%M:%S %Z", _time.localtime(epoch))
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -696,7 +865,12 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in (
+            "error",
+            "account-quarantined",
+            "blocked-orgs-record-unusable",
+            "all-eligible-seats-blocked",
+        ):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
@@ -998,6 +1172,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] in ("block-org", "unblock-org", "blocked-orgs"):
+        _blocked_orgs_command(argv[0], argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1032,6 +1209,9 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s block-org <org> --evidence TEXT   keep an org's seats out of auto
+  %(prog)s unblock-org <org>          return a blocked org's seats to auto
+  %(prog)s blocked-orgs               show which orgs auto is skipping, and why
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account

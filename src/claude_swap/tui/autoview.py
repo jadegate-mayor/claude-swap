@@ -45,6 +45,8 @@ _EVENT_ROLES = {
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
+    "blocked-orgs-record-unusable": "sev_warn",
+    "all-eligible-seats-blocked": "sev_crit",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 

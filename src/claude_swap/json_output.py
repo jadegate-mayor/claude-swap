@@ -222,6 +222,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     tier: dict | None = None,
+    org_blocked: bool = False,
 ) -> dict:
     """A full account row for ``--list``.
 
@@ -248,6 +249,10 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field, same rule: present only when the seat's organization is
+    # in the blocked-orgs record, i.e. `cswap auto` will not select it.
+    if org_blocked:
+        row["orgBlocked"] = True
     if tier:
         row.update(tier)
     if usage is not None:

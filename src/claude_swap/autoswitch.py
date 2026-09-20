@@ -41,6 +41,18 @@ and three further rules apply — none of them when no model is configured:
 * an ACTIVE account whose fresh reads lose that window ``unhealthy_ticks``
   distinct fetches in a row is treated as at its limit and left
   (``model-window-lost``); a single read never moves it.
+
+Independently of any model, seats whose ORGANIZATION is in the blocked-orgs
+record (:mod:`claude_swap.blocked_orgs`, written by ``cswap block-org``) are
+ineligible for every trigger (``org-blocked``): an organization that has
+disabled Claude Code access serves nothing while its usage windows read as
+room, which is the one thing this engine's numbers cannot show. The record
+is read once at the top of every tick. An ACTIVE seat whose org is blocked
+fails over at once, the way ``active-usage-unknown`` does at its count. An
+entry never expires on a timer; a missing or unparseable record excludes
+nothing and says so every tick; and when every otherwise-eligible seat is
+blocked the engine stays put and raises ``all-eligible-seats-blocked``. It
+never disables or enables a seat — a block is a ranking filter, nothing more.
 """
 
 from __future__ import annotations
@@ -58,7 +70,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import blocked_orgs, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -561,6 +573,87 @@ class ModelWindowLostEvent(AutoSwitchEvent):
         )
 
 
+@dataclass(frozen=True)
+class OrgBlockedSkipEvent(AutoSwitchEvent):
+    """Seats held out of this tick's ranking because their organization is in
+    the blocked-orgs record. One event per blocked label per tick, so the log
+    shows the filter working every tick it applies — a block nobody can see
+    is a block nobody remembers to lift."""
+
+    kind: ClassVar[str] = "org-blocked-skip"
+    label: str
+    numbers: tuple[str, ...]
+    active: bool = False  # the ACTIVE seat is among them
+
+    def _fields(self) -> dict:
+        return {
+            "organization": self.label,
+            "accounts": [int(n) for n in self.numbers],
+            "activeBlocked": self.active,
+        }
+
+    def human(self) -> str:
+        seats = ", ".join(f"#{n}" for n in self.numbers)
+        tail = " — includes the ACTIVE seat, failing over" if self.active else ""
+        return f"skip: org blocked {self.label} ({seats}){tail}"
+
+
+@dataclass(frozen=True)
+class BlockedOrgsRecordEvent(AutoSwitchEvent):
+    """The blocked-orgs record could not be used this tick, so NO seat is
+    excluded. Emitted once per tick for as long as it is true: silence here
+    would re-admit a dead organization's seats with nothing in the log."""
+
+    kind: ClassVar[str] = "blocked-orgs-record-unusable"
+    problem: str
+    path: str
+
+    def _fields(self) -> dict:
+        return {"problem": self.problem, "path": self.path}
+
+    def human(self) -> str:
+        cure = (
+            "run 'cswap blocked-orgs --init' if no org should be blocked"
+            if self.problem == blocked_orgs.PROBLEM_MISSING
+            else "fix the file or re-create it with 'cswap block-org'"
+        )
+        return (
+            f"WARNING: blocked-orgs record {self.problem} ({self.path}) — "
+            f"NO org is being excluded this tick; {cure}"
+        )
+
+
+@dataclass(frozen=True)
+class AllEligibleSeatsBlockedEvent(AutoSwitchEvent):
+    """Every seat that could otherwise take over sits in a blocked
+    organization. The engine stays where it is — a blocked seat is never a
+    target, and there is nowhere else to go — and says so every tick."""
+
+    kind: ClassVar[str] = "all-eligible-seats-blocked"
+    labels: tuple[str, ...]
+    numbers: tuple[str, ...]
+    staying_on: str
+    active_blocked: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "organizations": list(self.labels),
+            "accounts": [int(n) for n in self.numbers],
+            "stayingOn": int(self.staying_on),
+            "activeBlocked": self.active_blocked,
+        }
+
+    def human(self) -> str:
+        seats = ", ".join(f"#{n}" for n in self.numbers)
+        where = f"staying on Account-{self.staying_on}"
+        if self.active_blocked:
+            where += ", whose own org is blocked"
+        return (
+            f"ALARM: all eligible seats blocked ({', '.join(self.labels)}: "
+            f"{seats}) — {where}; unblock an org or add a seat"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -633,6 +726,10 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
 # visible next to the ones it merely ranked lower — otherwise the poll line
 # reads as "ignored an account with 47 points".
 MODEL_WINDOW_MISSING = "model-window-missing"
+# Why a candidate whose organization is in the blocked-orgs record is skipped.
+# Takes precedence over MODEL_WINDOW_MISSING on the poll line: it is the
+# reason that stays true whatever the usage endpoint reports next.
+ORG_BLOCKED = "org-blocked"
 
 
 def _named_models(models: Sequence[str]) -> tuple[str, ...]:
@@ -847,6 +944,15 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Account number → organization label, for every seat (the active one
+        # included) whose org is in the blocked-orgs record. Rebuilt from the
+        # file at the top of EVERY tick and read by the ranking helpers, so a
+        # `cswap block-org` / `unblock-org` takes effect on the next tick with
+        # no restart, and one tick never decides on two readings of the file.
+        self._tick_org_blocked: dict[str, str] = {}
+        # Last blocked map written to claude-swap.log (the event stream gets
+        # the skip line every tick; the rotating log only when it changes).
+        self._logged_org_blocked: dict[str, str] | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -1057,6 +1163,8 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        record = self._read_blocked_orgs_record()
+        self._tick_org_blocked = {}
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1097,6 +1205,9 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        self._tick_org_blocked = self._org_blocked_seats(record, current)
+        active_org_blocked = current in self._tick_org_blocked
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
@@ -1117,7 +1228,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
-                skipped=self._model_window_skips(
+                skipped=self._candidate_skips(
                     usage,
                     [
                         n
@@ -1130,6 +1241,7 @@ class AutoSwitchEngine:
                 tiers=self._plan_tier_labels(),
             )
         )
+        self._report_org_blocked(current)
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1148,7 +1260,16 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         model_window_lost = False
-        if active_headroom is not None:
+        if active_org_blocked:
+            # The record says this seat's organization cannot serve at all.
+            # Its usage windows are beside the point — on 2026-09-20 they read
+            # 13% while every turn died — so this is a failover exactly as
+            # `active-usage-unknown` reaching its count is: no cooldown, no
+            # landing gate, any seat with real headroom beats a dead one. No
+            # counting first either: the record is a written verdict with its
+            # evidence attached, not a transient read.
+            trigger = "failover"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             missing_reads = self._count_active_model_window(usage, entries, current)
@@ -1305,6 +1426,12 @@ class AutoSwitchEngine:
         if not oauth_candidates and not api_key_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
+            if active_org_blocked:
+                # Nowhere to go from a seat whose org is blocked: same alarm
+                # as the ranked case below, and the normal cadence with it —
+                # an unblock or a new seat can arrive at any moment.
+                self._alarm_all_blocked(current, [])
+                return TickOutcome.BLOCKED
             self._blocked_wait_long = True
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
@@ -1450,6 +1577,19 @@ class AutoSwitchEngine:
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
+        if not ordered and self._all_eligible_blocked(
+            current, usage, headroom, oauth_candidates
+        ):
+            # STAY PUT. A blocked seat is never a target, so there is nothing
+            # to thrash between; the alarm repeats every tick until someone
+            # unblocks an org or adds a seat. A healthy below-threshold active
+            # is not wanting to move, so its outcome stays what it would have
+            # been (cron wrappers keying on BLOCKED must not see a false one);
+            # every trigger that NEEDED a target reports BLOCKED.
+            self._alarm_all_blocked(current, oauth_candidates)
+            if trigger != "consume-first":
+                return TickOutcome.BLOCKED
+
         if not ordered:
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
@@ -1511,7 +1651,7 @@ class AutoSwitchEngine:
             # they ALL lack it the state is "no seat can serve the model",
             # reported as no-qualifying-candidate at the normal cadence: a
             # window can reappear (credits topped up) at any moment.
-            skipped = self._model_window_skips(usage, oauth_candidates)
+            skipped = self._candidate_skips(usage, oauth_candidates)
             candidate_headrooms = [
                 headroom.get(n) for n in oauth_candidates if n not in skipped
             ]
@@ -1554,7 +1694,10 @@ class AutoSwitchEngine:
         # headroom), not at its account-wide number: for the model it can
         # serve nothing, and the no-return release compares the seat's later
         # headroom against this value — recorded at 48 account-wide points a
-        # window returning with 6 would never read as "recovered".
+        # window returning with 6 would never read as "recovered". (A seat
+        # left because its org is blocked needs no such treatment: it leaves
+        # on `failover`, whose release reads the seat's CURRENT headroom and
+        # never this baseline, so once unblocked it is a landing spot again.)
         left_snapshot = (
             0.0 if model_window_lost else active_headroom,
             _binding_recovery_ts(usage.get(current), self._models, decided_now),
@@ -2029,7 +2172,12 @@ class AutoSwitchEngine:
         # quota the fleet has nor holds the all-above escape open. It still
         # counts as READABLE (`any_known`): "no candidate has readable usage"
         # would be a lie about a seat we measured and refused.
-        skipped = self._model_window_skips(usage, oauth_candidates)
+        #
+        # A candidate whose organization is in the blocked-orgs record is
+        # dropped at the same point and for every trigger, failover included:
+        # its windows can read as all the room in the world while the org
+        # serves nothing, which is the one thing the numbers cannot show.
+        skipped = self._candidate_skips(usage, oauth_candidates)
         any_known = any(headroom.get(n) is not None for n in oauth_candidates)
         oauth_candidates = [n for n in oauth_candidates if n not in skipped]
         # consume-first ranks by the soonest reset on its axis — the weekly
@@ -2512,17 +2660,166 @@ class AutoSwitchEngine:
             if _model_window_state(usage.get(num), self._named_models) == "missing"
         }
 
+    def _candidate_skips(
+        self, usage: dict[str, dict | str | None], numbers: Sequence[str]
+    ) -> dict[str, str]:
+        """Candidate number → why it is not a target this tick, in ``numbers``
+        order: ORG_BLOCKED for a seat whose organization is in the blocked-orgs
+        record, else MODEL_WINDOW_MISSING (rule 1). The block wins when both
+        apply — it holds whatever the next usage read says."""
+        windowless = self._model_window_skips(usage, numbers)
+        blocked = self._tick_org_blocked
+        return {
+            num: ORG_BLOCKED if num in blocked else windowless[num]
+            for num in numbers
+            if num in blocked or num in windowless
+        }
+
     def _skipped_suffix(
         self, usage: dict[str, dict | str | None], numbers: Sequence[str]
     ) -> str:
-        """Detail-text tail naming the candidates rule 1 skipped, or ""."""
-        skipped = self._model_window_skips(usage, numbers)
-        if not skipped:
-            return ""
-        return (
-            f"; {len(skipped)} candidate(s) skipped: no {self._model_label} "
-            "window (#" + ", #".join(skipped) + ")"
+        """Detail-text tail naming the candidates that were skipped, or ""."""
+        skipped = self._candidate_skips(usage, numbers)
+        windowless = [n for n, why in skipped.items() if why == MODEL_WINDOW_MISSING]
+        blocked = [n for n, why in skipped.items() if why == ORG_BLOCKED]
+        out = ""
+        if windowless:
+            out += (
+                f"; {len(windowless)} candidate(s) skipped: no "
+                f"{self._model_label} window (#" + ", #".join(windowless) + ")"
+            )
+        if blocked:
+            out += (
+                f"; {len(blocked)} candidate(s) skipped: org blocked ("
+                + ", ".join(f"#{n} {self._tick_org_blocked[n]}" for n in blocked)
+                + ")"
+            )
+        return out
+
+    # -- blocked organizations ------------------------------------------------
+
+    def _read_blocked_orgs_record(self) -> blocked_orgs.BlockedOrgsRecord:
+        """Read the blocked-orgs record ONCE for this tick. Never raises.
+
+        FAIL SAFE: a missing or unparseable record excludes nothing, and says
+        so — one event and one log line per tick, every tick it stays true.
+        Not a crash (the rotation loop outlives a bad file) and not silence (a
+        record that stops applying re-admits a dead org's seats, and the
+        2026-09-20 outage was 1 h 44 min of exactly that kind of quiet)."""
+        path = blocked_orgs.record_path(self.switcher.backup_dir)
+        try:
+            record = blocked_orgs.load(path)
+        except Exception as e:  # load() never raises; this is the belt
+            record = blocked_orgs.BlockedOrgsRecord(
+                problem=f"unreadable: {type(e).__name__}: {e}"
+            )
+        if record.problem:
+            _logger.warning(
+                "blocked-orgs record %s (%s): NO org is excluded this tick",
+                record.problem,
+                path,
+            )
+            self._emit(BlockedOrgsRecordEvent(problem=record.problem, path=str(path)))
+        return record
+
+    def _org_blocked_seats(
+        self, record: blocked_orgs.BlockedOrgsRecord, current: str
+    ) -> dict[str, str]:
+        """Seat number → org label for the active seat and every switchable
+        one whose label is in the record. Keyed on the label ``cswap list``
+        prints in brackets — never the email domain. A seat with no
+        organization has no label and is never blocked."""
+        if not record.orgs:
+            return {}
+        out: dict[str, str] = {}
+        seats = dict.fromkeys([current, *self.switcher.switchable_account_numbers()])
+        for num in seats:
+            label = self.switcher.account_org_label(num)
+            if record.is_blocked(label):
+                out[num] = label
+        return out
+
+    def _report_org_blocked(self, current: str) -> None:
+        """「skip: org blocked <label>」 — one line per blocked label, every
+        tick, on the event stream; the rotating log gets it on change."""
+        blocked = self._tick_org_blocked
+        by_label: dict[str, list[str]] = {}
+        for num, label in blocked.items():
+            by_label.setdefault(label, []).append(num)
+        for label, numbers in by_label.items():
+            self._emit(
+                OrgBlockedSkipEvent(
+                    label=label, numbers=tuple(numbers), active=current in numbers
+                )
+            )
+        if blocked != self._logged_org_blocked:
+            if blocked:
+                _logger.warning(
+                    "auto-switch is skipping blocked orgs: %s",
+                    "; ".join(
+                        f"{label} (#" + ", #".join(nums) + ")"
+                        for label, nums in by_label.items()
+                    ),
+                )
+            elif self._logged_org_blocked:
+                _logger.warning("auto-switch is no longer skipping any blocked org")
+            self._logged_org_blocked = dict(blocked)
+
+    def _all_eligible_blocked(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        oauth_candidates: Sequence[str],
+    ) -> bool:
+        """Whether every seat that could otherwise take over is org-blocked.
+
+        True when no UNBLOCKED candidate is usable this tick (readable, real
+        headroom, serves the configured model) while the block is what stands
+        in the way: the active seat is itself blocked, or some blocked
+        candidate is not known to be unusable on its own account. A blocked
+        seat we cannot read counts as otherwise-eligible — the alarm errs
+        toward sounding. With nothing blocked this is always False, so the
+        pre-existing verdicts (all-exhausted, no-qualifying-candidate) keep
+        every case they had."""
+        blocked = self._tick_org_blocked
+        if not blocked:
+            return False
+        windowless = self._model_window_skips(usage, oauth_candidates)
+        for num in oauth_candidates:
+            if num in blocked or num in windowless:
+                continue
+            h = headroom.get(num)
+            if h is not None and h > 0:
+                return False  # somewhere real to go; not the block's doing
+        if current in blocked:
+            return True
+        for num in oauth_candidates:
+            if num not in blocked or num in windowless:
+                continue
+            h = headroom.get(num)
+            if h is None or h > 0:
+                return True
+        return False
+
+    def _alarm_all_blocked(
+        self, current: str, oauth_candidates: Sequence[str]
+    ) -> None:
+        """「all eligible seats blocked」 — to the event stream and, at ERROR,
+        to claude-swap.log. Every tick it holds; see `_all_eligible_blocked`."""
+        blocked = self._tick_org_blocked
+        numbers = tuple(
+            n for n in dict.fromkeys([current, *oauth_candidates]) if n in blocked
         )
+        labels = tuple(dict.fromkeys(blocked[n] for n in numbers))
+        event = AllEligibleSeatsBlockedEvent(
+            labels=labels,
+            numbers=numbers,
+            staying_on=current,
+            active_blocked=current in blocked,
+        )
+        _logger.error(event.human())
+        self._emit(event)
 
     def _count_active_model_window(
         self,

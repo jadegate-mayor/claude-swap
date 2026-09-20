@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, plan_tier
+from claude_swap import blocked_orgs, oauth, pace, plan_tier
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -73,6 +73,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -1937,6 +1938,60 @@ class ClaudeAccountSwitcher:
         """Stored email for a slot; empty string when unknown."""
         data = self._get_sequence_data() or {}
         return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
+
+    def account_org_label(self, account_num: str) -> str:
+        """The organization label ``cswap list`` prints in brackets for a slot,
+        or "" for a seat with no organization (shown there as ``personal``).
+
+        This — never the email domain — is the key of the blocked-orgs record
+        (see :mod:`claude_swap.blocked_orgs`)."""
+        data = self._get_sequence_data() or {}
+        acct = data.get("accounts", {}).get(str(account_num), {})
+        return acct.get("organizationName", "") or ""
+
+    def known_org_labels(self) -> set[str]:
+        """Every organization label some managed account carries."""
+        data = self._get_sequence_data() or {}
+        return {
+            name
+            for acct in data.get("accounts", {}).values()
+            if isinstance(acct, dict) and (name := acct.get("organizationName"))
+        }
+
+    def blocked_orgs_record(self) -> blocked_orgs.BlockedOrgsRecord:
+        """The blocked-orgs record as it stands on disk. Never raises."""
+        return blocked_orgs.load(blocked_orgs.record_path(self.backup_dir))
+
+    @staticmethod
+    def _blocked_orgs_notes(
+        record: blocked_orgs.BlockedOrgsRecord, *, active_org: str | None = None
+    ) -> list[str]:
+        """Human lines about the blocked-orgs record for ``list`` / ``status``.
+
+        ``active_org`` narrows it to the one seat ``status`` shows. A missing
+        record is not reported here (see ``_build_list_payload``)."""
+        notes: list[str] = []
+        if active_org is None:
+            for label, org in sorted(record.orgs.items()):
+                why = f": {org.evidence}" if org.evidence else ""
+                notes.append(
+                    f"Org blocked: {label} — cswap auto skips its seats "
+                    f"(by {org.written_by}{why}). Lift with: cswap unblock-org "
+                    f"{label!r}"
+                )
+        elif record.is_blocked(active_org):
+            org = record.orgs[active_org]
+            why = f": {org.evidence}" if org.evidence else ""
+            notes.append(
+                f"This seat's org is blocked: {active_org} — cswap auto will "
+                f"fail over off it (by {org.written_by}{why})"
+            )
+        if record.problem and record.problem != blocked_orgs.PROBLEM_MISSING:
+            notes.append(
+                f"Blocked-orgs record {record.problem} — NO org is being "
+                "excluded from cswap auto"
+            )
+        return notes
 
     def current_account_number(self) -> str | None:
         """Slot of the live login; ``None`` when there is none or it's unmanaged.
@@ -5623,6 +5678,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
+        blocked = self.blocked_orgs_record()
         for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
             if is_active:
                 active_num = num
@@ -5643,6 +5699,7 @@ class ClaudeAccountSwitcher:
                     tier=plan_tier.tier_json_fields(
                         seq_data.get("accounts", {}).get(str(num))
                     ),
+                    org_blocked=blocked.is_blocked(org_name),
                 )
             )
         payload = {
@@ -5650,6 +5707,15 @@ class ClaudeAccountSwitcher:
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        # Additive, absent when clean: which org labels are blocked, and — the
+        # loud half — why the record is excluding nothing when it cannot be
+        # read. A MISSING record is the ordinary state of a store that has
+        # never blocked anything, so only a real read failure is reported here;
+        # `cswap auto` is where a missing record is called out every tick.
+        if blocked.orgs:
+            payload["blockedOrgs"] = sorted(blocked.orgs)
+        if blocked.problem and blocked.problem != blocked_orgs.PROBLEM_MISSING:
+            payload["blockedOrgsProblem"] = blocked.problem
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -5709,6 +5775,7 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries)
 
         seq_data = self._get_sequence_data() or {}
+        blocked = self.blocked_orgs_record()
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
@@ -5723,6 +5790,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            if blocked.is_blocked(org_name):
+                markers += f" {yellowed('(org blocked)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -5739,11 +5808,14 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        block_notes = self._blocked_orgs_notes(blocked)
+        if dup_warnings or lockstep_warnings or block_notes:
             print()
             for msg in dup_warnings:
                 warning(msg)
             for msg in lockstep_warnings:
+                warning(msg)
+            for msg in block_notes:
                 warning(msg)
 
         # Running instances
@@ -5839,6 +5911,8 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
+        if self.blocked_orgs_record().is_blocked(org_name):
+            active["orgBlocked"] = True
         active.update(plan_tier.tier_json_fields(acct))
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
@@ -5894,6 +5968,10 @@ class ClaudeAccountSwitcher:
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
+            for msg in self._blocked_orgs_notes(
+                self.blocked_orgs_record(), active_org=org_name
+            ):
+                warning(msg)
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
@@ -6484,6 +6562,17 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
         )
+        if not json_output:
+            # An explicit switch onto a blocked org's seat is allowed (that is
+            # how an operator tests whether the org is back) but it will not
+            # hold: the next auto tick fails over off it. Say so now.
+            label = self.account_org_label(target_account)
+            if self.blocked_orgs_record().is_blocked(label):
+                warning(
+                    f"Account-{target_account}'s org is blocked ({label}): "
+                    "cswap auto will fail over off it on its next tick. "
+                    f"Lift it first with: cswap unblock-org {label!r}"
+                )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
