@@ -957,6 +957,10 @@ class AutoSwitchEngine:
         # alarm is a statement about the POOL, judged once per tick, however
         # many snapshots the tick goes on to rank.
         self._tick_alarmed = False
+        # Whether an enabled, unquarantined API-key account stands behind the
+        # pool this tick. It has no org and no window, and it is where an
+        # escape lands — so while it exists the pool is not dead.
+        self._tick_api_key_fallback = False
 
     # -- state file ---------------------------------------------------------
 
@@ -1170,6 +1174,7 @@ class AutoSwitchEngine:
         record = self._read_blocked_orgs_record()
         self._tick_org_blocked = {}
         self._tick_alarmed = False
+        self._tick_api_key_fallback = False
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1212,6 +1217,16 @@ class AutoSwitchEngine:
 
         self._tick_org_blocked = self._org_blocked_seats(record, current)
         active_org_blocked = current in self._tick_org_blocked
+        self._tick_api_key_fallback = bool(
+            self._tick_org_blocked
+            and settings.include_api_key_accounts
+            and any(
+                n != current
+                and n not in quarantined
+                and self.switcher.account_kind_for(n) == "api_key"
+                for n in self.switcher.switchable_account_numbers()
+            )
+        )
 
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
@@ -1259,9 +1274,7 @@ class AutoSwitchEngine:
             # NOT when the active seat is itself blocked: that tick is about to
             # refetch its possible targets and fail over, so the verdict waits
             # for the refreshed snapshot (an alarm followed by a successful
-            # switch in the same tick is a false outage report). And not while
-            # an enabled API-key account stands behind the pool: it has no org
-            # and no window, and it is where an escape would land.
+            # switch in the same tick is a false outage report).
             census = [
                 n
                 for n in self.switcher.switchable_account_numbers()
@@ -1269,15 +1282,7 @@ class AutoSwitchEngine:
                 and n not in quarantined
                 and self.switcher.account_kind_for(n) != "api_key"
             ]
-            api_key_fallback = settings.include_api_key_accounts and any(
-                n != current
-                and n not in quarantined
-                and self.switcher.account_kind_for(n) == "api_key"
-                for n in self.switcher.switchable_account_numbers()
-            )
-            if not api_key_fallback and self._all_eligible_blocked(
-                current, usage, headroom, census
-            ):
+            if self._all_eligible_blocked(current, usage, headroom, census):
                 self._alarm_all_blocked(current, census)
 
         if not self._model_check_done:
@@ -2843,11 +2848,16 @@ class AutoSwitchEngine:
         healthy ticks, and a failed fetch looks the same — is NOT evidence:
         the alarm claims a fact about the pool and waits until it has one
         (the tick's own reason line already says when usage is unreadable).
+        Nor is the pool dead while an enabled API-key account stands behind it.
         A BLOCKED seat we cannot read does count as otherwise-eligible. With
         nothing blocked this is always False, so the pre-existing verdicts
         (all-exhausted, no-qualifying-candidate) keep every case they had."""
         blocked = self._tick_org_blocked
-        if not blocked:
+        if not blocked or self._tick_api_key_fallback:
+            # The fallback check lives HERE, not at a call site: every path to
+            # the alarm asks this one question. (A consume-first nudge never
+            # targets an API-key account, so its `ordered` is empty with the
+            # fallback standing right there — and that is not an outage.)
             return False
         windowless = self._model_window_skips(usage, oauth_candidates)
         for num in oauth_candidates:

@@ -556,7 +556,13 @@ def _blocked_orgs_command(action: str, argv: list[str]) -> None:
             if org.evidence:
                 print(f"     {muted(org.evidence)}")
     except ClaudeSwitchError as e:
-        error(f"Error: {e}")
+        # JSON mode keeps stdout a single parseable object on a handled
+        # failure too (lock contention on --init, a migration error), like
+        # the main and auto commands.
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")

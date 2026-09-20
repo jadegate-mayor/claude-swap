@@ -142,6 +142,19 @@ class TestRecord:
         for not_it in ("acme", "acme.example", "Acme ", "Acm", ""):
             assert not record.is_blocked(not_it), not_it
 
+    def test_a_label_is_kept_verbatim_whitespace_included(self, tmp_path):
+        """Review round 3 (P2). The roster keeps an org named `Acme ` with its
+        trailing space; stripping it on the way in refused the exact label,
+        and with --force wrote `Acme`, which blocks nothing."""
+        entry = blocked_orgs.block(
+            tmp_path, "Acme ", by="hand", evidence="x", known_labels={"Acme "}
+        )
+        assert entry.label == "Acme "
+        record = blocked_orgs.load(blocked_orgs.record_path(tmp_path))
+        assert record.is_blocked("Acme ") and not record.is_blocked("Acme")
+        assert blocked_orgs.unblock(tmp_path, "Acme", by="hand") is None
+        assert blocked_orgs.unblock(tmp_path, "Acme ", by="hand") is not None
+
     def test_a_missing_record_blocks_nothing_and_says_so(self, tmp_path):
         record = blocked_orgs.load(tmp_path / "blocked-orgs.json")
         assert record.orgs == {}
@@ -858,6 +871,29 @@ class TestAllEligibleSeatsBlocked:
         # (The same pool WITHOUT a fallback alarms: see
         # test_a_healthy_best_strategy_active_alarms_too.)
 
+    def test_nor_under_consume_first_which_never_targets_an_api_key(self, temp_home):
+        """Review round 3 (P2): `ordered` is empty there with the fallback
+        standing right behind the pool — not an outage."""
+        h = _harness(
+            temp_home, seats=(1, 3, 4),
+            include_api_key_accounts=True, strategy="consume-first",
+        )
+        _block(h)
+        now = h.clock.now
+        real_kind = h.switcher.account_kind_for
+        h.seed(2, SEATS[2][0])
+        with patch.object(
+            h.switcher, "account_kind_for",
+            side_effect=lambda n: "api_key" if str(n) == "2" else real_kind(n),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _seat(seven_d_reset=now + 5 * DAY),
+                "3": _seat(seven_d_reset=now + 1 * DAY),
+                "4": _seat(seven_d_reset=now + 2 * DAY),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _of(h, AllEligibleSeatsBlockedEvent) == []
+
     def test_the_alarm_is_raised_once_per_tick_however_it_is_reached(self, temp_home):
         h = _harness(temp_home, seats=(3, 4))
         _block(h)
@@ -975,6 +1011,18 @@ class TestCli:
             _run("blocked-orgs")
         assert exc.value.code == 1
         assert "NO org is being excluded" in capsys.readouterr().err
+
+    def test_a_handled_failure_in_json_mode_is_a_json_error_envelope(self, store, capsys):
+        """Review round 3 (P2)."""
+        from claude_swap.exceptions import LockError
+
+        with patch.object(blocked_orgs, "init", side_effect=LockError("lock busy")), \
+             pytest.raises(SystemExit) as exc:
+            _run("blocked-orgs", "--init", "--json")
+        assert exc.value.code == 1
+        out = capsys.readouterr()
+        payload = json.loads(out.out)
+        assert payload["error"] == {"type": "LockError", "message": "lock busy"}
 
     @pytest.mark.parametrize("action", ["block-org", "unblock-org", "blocked-orgs"])
     def test_dispatched_from_main(self, temp_home, action):

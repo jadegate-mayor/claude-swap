@@ -257,11 +257,13 @@ def block(
     ``hand`` write replaces either kind.
     """
     _check_writer(by)
-    label = label.strip()
+    # The label is kept VERBATIM — it is matched exactly against what the
+    # roster holds, and an organization can be named with a trailing space.
+    # Stripping is used only to refuse a label that is nothing but space.
     evidence = evidence.strip()
-    if not label:
+    if not label.strip():
         raise BlockedOrgsError("an organization label is required")
-    if label.lower() == PERSONAL_TAG:
+    if label.strip().lower() == PERSONAL_TAG:
         raise BlockedOrgsError(
             f"'{PERSONAL_TAG}' is what cswap list shows for seats with no "
             "organization — it is not one organization and cannot be blocked"
@@ -309,9 +311,8 @@ def unblock(
     record, never an absent one — so "missing" stays an anomaly.
     """
     _check_writer(by)
-    label = label.strip()
     evidence = evidence.strip()
-    if not label:
+    if not label.strip():  # verbatim otherwise; see block()
         raise BlockedOrgsError("an organization label is required")
     if by == WRITER_WATCHDOG and not evidence:
         raise BlockedOrgsError(
