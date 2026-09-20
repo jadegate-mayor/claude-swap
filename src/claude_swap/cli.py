@@ -566,7 +566,10 @@ def _blocked_orgs_command(action: str, argv: list[str]) -> None:
 def _time_label(epoch: float) -> str:
     import time as _time
 
-    return _time.strftime("%Y-%m-%d %H:%M:%S %Z", _time.localtime(epoch))
+    try:
+        return _time.strftime("%Y-%m-%d %H:%M:%S %Z", _time.localtime(epoch))
+    except (OverflowError, OSError, ValueError):
+        return "unknown time"  # a finite epoch the platform cannot render
 
 
 def _swap_command(argv: list[str]) -> None:

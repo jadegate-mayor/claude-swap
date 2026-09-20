@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -120,13 +121,22 @@ def _coerce_entry(label: str, raw: dict) -> BlockedOrg:
     written_at = raw.get("written_at")
     if isinstance(written_at, bool) or not isinstance(written_at, (int, float)):
         written_at = 0.0
+    try:
+        # JSON admits integers no float can hold (OverflowError) and, through
+        # Python's parser, `1e999` (inf) and NaN. It is a description: an
+        # unrepresentable one reads as "unknown", it never breaks the record.
+        written_at = float(written_at)
+    except (OverflowError, ValueError):
+        written_at = 0.0
+    if not math.isfinite(written_at):
+        written_at = 0.0
     written_by = raw.get("written_by")
     if not isinstance(written_by, str) or not written_by:
         written_by = "unknown"
     evidence = raw.get("evidence")
     if not isinstance(evidence, str):
         evidence = ""
-    return BlockedOrg(label, float(written_at), written_by, evidence)
+    return BlockedOrg(label, written_at, written_by, evidence)
 
 
 def load(path: Path) -> BlockedOrgsRecord:
@@ -150,6 +160,13 @@ def load(path: Path) -> BlockedOrgsRecord:
         return BlockedOrgsRecord(problem=f"unparseable: {e}")
     except RecursionError:
         return BlockedOrgsRecord(problem="unparseable: nested too deeply")
+    try:
+        return _parse(raw)
+    except Exception as e:  # "never raises" is a promise, not an intention
+        return BlockedOrgsRecord(problem=f"unparseable: {type(e).__name__}: {e}")
+
+
+def _parse(raw: object) -> BlockedOrgsRecord:
     if not isinstance(raw, dict):
         return BlockedOrgsRecord(problem="unparseable: top level is not an object")
     table = raw.get("orgs")

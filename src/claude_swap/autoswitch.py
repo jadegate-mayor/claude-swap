@@ -953,6 +953,10 @@ class AutoSwitchEngine:
         # Last blocked map written to claude-swap.log (the event stream gets
         # the skip line every tick; the rotating log only when it changes).
         self._logged_org_blocked: dict[str, str] | None = None
+        # Whether this tick has already raised all-eligible-seats-blocked: the
+        # alarm is a statement about the POOL, judged once per tick, however
+        # many snapshots the tick goes on to rank.
+        self._tick_alarmed = False
 
     # -- state file ---------------------------------------------------------
 
@@ -1165,6 +1169,7 @@ class AutoSwitchEngine:
         settings = self.settings
         record = self._read_blocked_orgs_record()
         self._tick_org_blocked = {}
+        self._tick_alarmed = False
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1242,6 +1247,23 @@ class AutoSwitchEngine:
             )
         )
         self._report_org_blocked(current)
+        if self._tick_org_blocked:
+            # Judged HERE, before any trigger is classified: whether the pool
+            # has anywhere left to go does not depend on whether this tick
+            # wants to move. A healthy `best` active returns below-threshold,
+            # and a cooldown returns early, long before candidate selection —
+            # and a pool one wall away from dead is exactly when the line has
+            # to be in the log already. The outcome is untouched: NO_ACTION
+            # stays NO_ACTION.
+            census = [
+                n
+                for n in self.switcher.switchable_account_numbers()
+                if n != current
+                and n not in quarantined
+                and self.switcher.account_kind_for(n) != "api_key"
+            ]
+            if self._all_eligible_blocked(current, usage, headroom, census):
+                self._alarm_all_blocked(current, census)
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1427,8 +1449,8 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             if active_org_blocked:
-                # Nowhere to go from a seat whose org is blocked: same alarm
-                # as the ranked case below, and the normal cadence with it —
+                # Nowhere to go from a seat whose org is blocked. The alarm
+                # was raised at the top of the tick; keep the normal cadence —
                 # an unblock or a new seat can arrive at any moment.
                 self._alarm_all_blocked(current, [])
                 return TickOutcome.BLOCKED
@@ -1437,6 +1459,26 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+
+        if active_org_blocked and oauth_candidates:
+            # Same exposure as the model-window escape below, and wider: this
+            # failover fires with the active's windows ANYWHERE (13% on the
+            # day it was written for), so the collector never escalated and
+            # the peers' rows may be as old as the candidate cadence — or an
+            # idle hold — allows. A peer that read as room then can be at its
+            # wall now. Refetch the seats that could be targets (never the
+            # blocked ones: they cannot be) before choosing where to land,
+            # through the same exclusion that keeps a post-429 backoff intact.
+            entries = self.switcher.usage_entries_by_account(
+                fetch=self._without_planned_exhausted(
+                    {n for n in oauth_candidates if n not in self._tick_org_blocked},
+                    entries,
+                    usage,
+                    self.clock(),
+                )
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = _headroom_by_account(usage, self._models)
 
         if model_window_lost and oauth_candidates:
             # An at-limit escape normally runs on an escalated snapshot (the
@@ -1582,10 +1624,13 @@ class AutoSwitchEngine:
         ):
             # STAY PUT. A blocked seat is never a target, so there is nothing
             # to thrash between; the alarm repeats every tick until someone
-            # unblocks an org or adds a seat. A healthy below-threshold active
-            # is not wanting to move, so its outcome stays what it would have
-            # been (cron wrappers keying on BLOCKED must not see a false one);
-            # every trigger that NEEDED a target reports BLOCKED.
+            # unblocks an org or adds a seat. Usually already raised at the
+            # top of the tick (`_alarm_all_blocked` is once-per-tick); this
+            # call covers a refetch that only now showed the last unblocked
+            # seat spent. A healthy below-threshold active is not wanting to
+            # move, so its outcome stays what it would have been (cron
+            # wrappers keying on BLOCKED must not see a false one); every
+            # trigger that NEEDED a target reports BLOCKED.
             self._alarm_all_blocked(current, oauth_candidates)
             if trigger != "consume-first":
                 return TickOutcome.BLOCKED
@@ -2806,7 +2851,11 @@ class AutoSwitchEngine:
         self, current: str, oauth_candidates: Sequence[str]
     ) -> None:
         """「all eligible seats blocked」 — to the event stream and, at ERROR,
-        to claude-swap.log. Every tick it holds; see `_all_eligible_blocked`."""
+        to claude-swap.log. Every tick it holds, ONCE per tick; see
+        `_all_eligible_blocked`."""
+        if self._tick_alarmed:
+            return
+        self._tick_alarmed = True
         blocked = self._tick_org_blocked
         numbers = tuple(
             n for n in dict.fromkeys([current, *oauth_candidates]) if n in blocked

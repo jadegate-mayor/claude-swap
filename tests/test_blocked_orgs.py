@@ -207,7 +207,8 @@ class TestRecord:
         """Structural half of CONDITION 2: ``load`` and ``is_blocked`` — the
         only two things a decision goes through — must not touch time."""
         clocks = {"time", "datetime", "monotonic", "clock", "now", "today"}
-        for fn in (blocked_orgs.load, blocked_orgs.BlockedOrgsRecord.is_blocked,
+        for fn in (blocked_orgs.load, blocked_orgs._parse,
+                   blocked_orgs.BlockedOrgsRecord.is_blocked,
                    blocked_orgs._coerce_entry):
             assert clocks.isdisjoint(fn.__code__.co_names), fn.__name__
         # The guard can see a clock when there is one (it is not vacuous).
@@ -220,6 +221,37 @@ class TestRecord:
         assert record.is_blocked("Acme")
         org = record.orgs["Acme"]
         assert (org.written_at, org.written_by, org.evidence) == (0.0, "unknown", "")
+
+    @pytest.mark.parametrize(
+        "written_at",
+        ["1" + "0" * 400, "1e999", "-1e999", "NaN", "1e300", "true"],
+        ids=["int-too-big-for-float", "inf", "-inf", "nan", "finite-unrenderable", "bool"],
+    )
+    def test_an_unrepresentable_timestamp_cannot_break_the_record(
+        self, tmp_path, written_at, capsys
+    ):
+        """Review round 1: an integer no float can hold raised OverflowError
+        OUT of load() — crashing list/status/block, and (through the engine's
+        belt) silently dropping every block. `1e999` loaded as inf and crashed
+        the human listing. A description must never break the record."""
+        path = tmp_path / "blocked-orgs.json"
+        path.write_text(
+            '{"orgs": {"Acme": {"written_at": %s, "written_by": "hand"}}}' % written_at
+        )
+        record = blocked_orgs.load(path)
+        assert record.problem == ""
+        assert record.is_blocked("Acme")            # the block survives
+        expected = 1e300 if written_at == "1e300" else 0.0
+        assert record.orgs["Acme"].written_at == expected
+        json.dumps(record.to_json(), allow_nan=False)      # still portable JSON
+        assert cli._time_label(record.orgs["Acme"].written_at)  # and printable
+
+    def test_load_keeps_its_promise_even_if_parsing_itself_breaks(self, tmp_path):
+        path = tmp_path / "blocked-orgs.json"
+        path.write_text('{"orgs": {"Acme": {}}}')
+        with patch.object(blocked_orgs, "_coerce_entry", side_effect=RuntimeError("x")):
+            record = blocked_orgs.load(path)
+        assert record.orgs == {} and record.problem.startswith("unparseable")
 
     def test_unblock_is_the_only_exit_and_keeps_the_file(self, tmp_path):
         blocked_orgs.block(tmp_path, "Acme", by="hand", evidence="x")
@@ -528,6 +560,60 @@ class TestActiveSeatBecomesBlocked:
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert h.active_number() == 4                              # 0% used
 
+    def test_it_refetches_the_possible_targets_before_choosing_where_to_land(self, temp_home):
+        """Review round 1 (P1). The failover fires with the active's windows
+        anywhere (13% on the day), so the collector never escalated and the
+        peers' rows can be as old as the candidate cadence allows. A peer
+        that read as room then may be at its wall now."""
+        from tests.test_autoswitch import _entry_for
+
+        h = self._on_acme(temp_home)
+        _block(h)
+        stale = {
+            "3": _seat(five_h=13), "1": _seat(five_h=10),   # looked best...
+            "2": _seat(five_h=50), "4": _seat(five_h=0),
+        }
+        fresh = {**stale, "1": _seat(five_h=100)}           # ...is at its wall
+        calls: list = []
+
+        def entries(fetch=None, **_kw):
+            calls.append(fetch)
+            rows = fresh if fetch else stale
+            return {n: _entry_for(v, h.clock.now) for n, v in rows.items()}
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+            assert h.engine.tick() is TickOutcome.SWITCHED
+        assert h.active_number() == 2                        # not the spent #1
+        # Only seats that could be targets: never the blocked sibling, and
+        # never the active row (it is the evidence that fired).
+        assert {"1", "2"} in calls
+
+    def test_the_refetch_honours_a_post_429_exhausted_plan(self, temp_home):
+        from dataclasses import replace
+
+        from claude_swap import poll_policy
+        from tests.test_autoswitch import _entry_for
+
+        h = self._on_acme(temp_home)
+        _block(h)
+        now = h.clock.now
+        rows = {
+            "3": _entry_for(_seat(five_h=13), now),
+            "1": replace(
+                _entry_for(_seat(five_h=100), now),
+                next_poll_at=now + 10 * poll_policy.EXHAUSTED_INTERVAL_S,
+                poll_interval_s=10 * poll_policy.EXHAUSTED_INTERVAL_S,
+            ),
+            "2": _entry_for(_seat(five_h=50), now),
+            "4": _entry_for(_seat(five_h=0), now),
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=rows
+        ) as fetch:
+            assert h.engine.tick() is TickOutcome.SWITCHED
+        fetched = [c.kwargs.get("fetch") for c in fetch.call_args_list]
+        assert {"2"} in fetched and {"1", "2"} not in fetched
+
     def test_it_never_lands_on_a_sibling_seat_of_the_same_org(self, temp_home):
         h = self._on_acme(temp_home)
         _block(h)
@@ -686,6 +772,43 @@ class TestAllEligibleSeatsBlocked:
         assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 1
         assert _of(h, NoSwitchEvent)[-1].reason == "already-consuming-soonest"
         assert "org blocked (#3 Acme, #4 Acme)" in _of(h, NoSwitchEvent)[-1].detail
+
+    def test_a_healthy_best_strategy_active_alarms_too(self, temp_home):
+        """Review round 1 (P2). `best` returns below-threshold long before
+        candidate selection; the alarm is about the POOL, so it is judged
+        before any trigger is classified — and changes no outcome."""
+        h = _harness(temp_home, seats=(1, 3, 4))            # strategy: best
+        _block(h)
+        usage = {"1": _seat(five_h=20), "3": _seat(five_h=1), "4": _seat(five_h=2)}
+        for _ in range(3):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 3
+        assert _of(h, NoSwitchEvent)[-1].reason == "below-threshold"
+
+    def test_a_cooldown_return_does_not_swallow_the_alarm(self, temp_home):
+        h = _harness(temp_home, seats=(2, 1, 3, 4), cooldown_seconds=3600)
+        assert h.tick_with_usage({
+            "2": _seat(five_h=95), "1": _seat(five_h=50),
+            "3": _seat(five_h=1), "4": _seat(five_h=100),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        make_live(h, 3)
+        _block(h, "Initech")                       # seats 1 and 2
+        h.events.clear()
+        # Wants to move (95%), but is inside the cooldown; the only unblocked
+        # peer is spent and the two with room are blocked.
+        assert h.tick_with_usage({
+            "3": _seat(five_h=95), "4": _seat(five_h=100),
+            "1": _seat(five_h=50), "2": _seat(five_h=60),
+        }) is TickOutcome.NO_ACTION
+        assert _of(h, NoSwitchEvent)[-1].reason == "cooldown"
+        assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 1
+
+    def test_the_alarm_is_raised_once_per_tick_however_it_is_reached(self, temp_home):
+        h = _harness(temp_home, seats=(3, 4))
+        _block(h)
+        h.tick_with_usage({"3": _seat(five_h=13), "4": _seat(five_h=0)})
+        assert len(_of(h, AllEligibleSeatsBlockedEvent)) == 1
 
     def test_no_alarm_while_an_unblocked_seat_has_real_headroom(self, temp_home):
         h = _harness(temp_home)
